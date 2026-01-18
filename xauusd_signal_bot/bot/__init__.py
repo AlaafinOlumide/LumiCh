@@ -1,0 +1,1 @@
+"""XAUUSD signal bot package."""
