@@ -14,8 +14,11 @@ class Config:
     log_level: str = "INFO"
 
     # ===== Trading sessions (string for sessions.py) =====
-    # Format: "HH:MM-HH:MM,HH:MM-HH:MM,HH:MM-HH:MM" in GMT/UTC
     trading_sessions: str = "00:00-03:00,07:00-11:00,12:00-20:00"
+
+    # ===== News filter + polling (missing fields) =====
+    news_api_provider: str = "fmp"
+    poll_seconds: int = 60
 
     # ===== Risk rules =====
     risk_per_trade_pct: float = 0.25
@@ -34,10 +37,6 @@ class Config:
 
     @classmethod
     def from_env(cls):
-        """
-        Loads config from Render environment variables.
-        """
-
         def get_env(name: str, default=None, required: bool = False):
             value = os.getenv(name, default)
             if required and (value is None or str(value).strip() == ""):
@@ -52,6 +51,9 @@ class Config:
             symbol=get_env("SYMBOL", "XAUUSD"),
             log_level=get_env("LOG_LEVEL", "INFO"),
             trading_sessions=get_env("TRADING_SESSIONS", "00:00-03:00,07:00-11:00,12:00-20:00"),
+
+            news_api_provider=get_env("NEWS_API_PROVIDER", "fmp"),
+            poll_seconds=int(get_env("POLL_SECONDS", 60)),
 
             risk_per_trade_pct=float(get_env("RISK_PER_TRADE_PCT", 0.25)),
             max_daily_loss_pct=float(get_env("MAX_DAILY_LOSS_PCT", 3.0)),
