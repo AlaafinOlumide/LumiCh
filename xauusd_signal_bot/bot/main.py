@@ -56,7 +56,7 @@ def main() -> None:
     load_dotenv()
     setup_logging()
 
-   cfg = Config.from_env()
+    cfg = Config.from_env()
     cfg_global = cfg
 
     log = logging.getLogger("xauusd_bot")
