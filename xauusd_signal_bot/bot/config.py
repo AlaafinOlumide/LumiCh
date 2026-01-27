@@ -1,6 +1,5 @@
 import os
 from dataclasses import dataclass
-from typing import List
 
 
 @dataclass
@@ -14,9 +13,9 @@ class Config:
     SYMBOL: str = "XAUUSD"
     LOG_LEVEL: str = "INFO"
 
-    # ===== Trading sessions (what main.py expects) =====
-    # Format: "HH:MM-HH:MM" in GMT/UTC
-    trading_sessions: str = "00:00-03:00,07:00-11:00,12:00-20:00"  # will be set in from_env()
+    # ===== Trading sessions (string that sessions.py can split) =====
+    # Format: "HH:MM-HH:MM,HH:MM-HH:MM,HH:MM-HH:MM" in GMT/UTC
+    trading_sessions: str = "00:00-03:00,07:00-11:00,12:00-20:00"
 
     # ===== Risk rules =====
     RISK_PER_TRADE_PCT: float = 0.25
@@ -37,9 +36,8 @@ class Config:
     def from_env(cls):
         """
         Render-friendly config loader.
-        Supports either:
-          - TRADING_SESSIONS="00:00-03:00,07:00-11:00,12:00-20:00"
-        or defaults to the sessions above.
+        TRADING_SESSIONS example:
+          "00:00-03:00,07:00-11:00,12:00-20:00"
         """
 
         def get_env(name: str, default=None, required: bool = False):
@@ -48,9 +46,7 @@ class Config:
                 raise RuntimeError(f"Missing required environment variable: {name}")
             return value
 
-        # Sessions: env override or default
         sessions_raw = get_env("TRADING_SESSIONS", "00:00-03:00,07:00-11:00,12:00-20:00")
-        sessions_list = [s.strip() for s in sessions_raw.split(",") if s.strip()]
 
         return cls(
             TWELVEDATA_API_KEY=get_env("TWELVEDATA_API_KEY", required=True),
@@ -60,7 +56,7 @@ class Config:
             SYMBOL=get_env("SYMBOL", "XAUUSD"),
             LOG_LEVEL=get_env("LOG_LEVEL", "INFO"),
 
-            trading_sessions=sessions_list,
+            trading_sessions=sessions_raw,
 
             RISK_PER_TRADE_PCT=float(get_env("RISK_PER_TRADE_PCT", 0.25)),
             MAX_DAILY_LOSS_PCT=float(get_env("MAX_DAILY_LOSS_PCT", 3.0)),
