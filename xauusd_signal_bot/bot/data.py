@@ -1,53 +1,92 @@
+# bot/data.py
+
 from __future__ import annotations
 
-import os
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 import requests
-from typing import List, Dict, Any
+import pandas as pd
+
+
+@dataclass
+class TimeSeriesResponse:
+    df: pd.DataFrame
+    raw: Dict[str, Any]
 
 
 class TwelveDataClient:
-    def __init__(self, api_key: str | None = None):
-        self.api_key = api_key or os.getenv("TWELVEDATA_API_KEY")
-        if not self.api_key:
-            raise RuntimeError("TWELVEDATA_API_KEY is required")
+    """
+    Minimal TwelveData REST client.
+    Provides fetch_time_series(...) used by bot/main.py:
+        td.fetch_time_series(symbol, "1h", outputsize=200).df
+    """
 
-    def fetch_ohlcv(self, symbol: str, interval: str, outputsize: int = 300) -> List[Dict[str, Any]]:
+    def __init__(self, api_key: str, base_url: str = "https://api.twelvedata.com"):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+
+    def fetch_time_series(
+        self,
+        symbol: str,
+        interval: str,
+        outputsize: int = 200,
+        timezone: str = "UTC",
+        dp: int = 5,
+    ) -> TimeSeriesResponse:
         """
-        Returns OHLCV as a list of dicts sorted oldest -> newest.
-        Each item: {"datetime","open","high","low","close","volume"}
+        Fetch OHLCV time series from TwelveData and return a TimeSeriesResponse
+        with a pandas DataFrame at .df.
+
+        DataFrame columns:
+            datetime, open, high, low, close, volume
+        Sorted ascending by datetime.
         """
-        url = "https://api.twelvedata.com/time_series"
+
+        if not self.api_key:
+            raise RuntimeError("TWELVEDATA_API_KEY is missing/empty")
+
+        url = f"{self.base_url}/time_series"
         params = {
             "symbol": symbol,
             "interval": interval,
             "outputsize": outputsize,
+            "timezone": timezone,
             "apikey": self.api_key,
+            "dp": dp,
             "format": "JSON",
-            "timezone": "UTC",
         }
 
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
 
-        if data.get("status") == "error":
-            raise RuntimeError(f"TwelveData error: {data.get('message')}")
+        # TwelveData uses "status":"error" with a message
+        if isinstance(data, dict) and data.get("status") == "error":
+            raise RuntimeError(f"TwelveData error: {data.get('message', data)}")
 
-        values = data.get("values", [])
+        values = data.get("values") if isinstance(data, dict) else None
         if not values:
-            raise RuntimeError(f"No data returned for {symbol} {interval}")
+            raise RuntimeError(f"TwelveData returned no values for {symbol} {interval}: {data}")
 
-        # TwelveData returns newest -> oldest, so reverse
-        values = list(reversed(values))
+        df = pd.DataFrame(values)
 
-        out: List[Dict[str, Any]] = []
-        for v in values:
-            out.append({
-                "datetime": v["datetime"],
-                "open": float(v["open"]),
-                "high": float(v["high"]),
-                "low": float(v["low"]),
-                "close": float(v["close"]),
-                "volume": float(v.get("volume") or 0),
-            })
-        return out
+        # Normalize expected columns
+        # TwelveData typically returns: datetime, open, high, low, close, volume (all as strings)
+        expected = ["datetime", "open", "high", "low", "close", "volume"]
+        for col in expected:
+            if col not in df.columns:
+                # volume can be missing for some assets
+                if col == "volume":
+                    df["volume"] = 0
+                else:
+                    raise RuntimeError(f"Missing column '{col}' in TwelveData response: columns={list(df.columns)}")
+
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Clean + order
+        df = df.dropna(subset=["datetime", "open", "high", "low", "close"]).sort_values("datetime").reset_index(drop=True)
+
+        return TimeSeriesResponse(df=df, raw=data)
