@@ -1,196 +1,252 @@
 from __future__ import annotations
 
-import datetime as dt
 from dataclasses import dataclass
-
-import pandas as pd
-
-from .indicators import adx, bollinger_bands, ema, rsi, stoch_oscillator
+from typing import List, Dict, Any, Optional
+import numpy as np
 
 
-@dataclass
-class TrendState:
-    timeframe: str
-    direction: str  # 'BULL', 'BEAR', 'NEUTRAL'
-    ema_fast: float
-    ema_slow: float
-    close: float
-    slope: str  # 'UP', 'DOWN', 'FLAT'
-
-
+# -----------------------------
+# Data model
+# -----------------------------
 @dataclass
 class Signal:
     symbol: str
-    timestamp_utc: dt.datetime
-    direction: str  # 'BUY'/'SELL'
+    side: str  # "BUY" or "SELL"
+    entry: float
+    sl: float
+    tp1: float
+    tp2: float
+    reason: str
+    score: float
     risk_tag: str
-    timeframe_mode: str
-    session_label: str
-    trend_state: TrendState
-    confirmations: list[str]
-    confirmations_passed: int
-    confirmations_required: int
-    adx_value: float
-    adx_min: float
-    news_status: str
-    reason_bullets: list[str]
 
 
-def detect_trend(df: pd.DataFrame, timeframe: str, ema_fast_p: int, ema_slow_p: int, slope_bars: int) -> TrendState:
-    close = df['close']
-    ef = ema(close, ema_fast_p)
-    es = ema(close, ema_slow_p)
+# -----------------------------
+# Helpers (no pandas)
+# -----------------------------
+def _arr(candles: List[Dict[str, Any]], key: str) -> np.ndarray:
+    return np.array([float(c[key]) for c in candles], dtype=float)
 
-    c = float(close.iloc[-1])
-    ef_now = float(ef.iloc[-1])
-    es_now = float(es.iloc[-1])
 
-    if len(ef) > slope_bars:
-        ef_prev = float(ef.iloc[-1 - slope_bars])
-        slope = 'UP' if ef_now > ef_prev else 'DOWN' if ef_now < ef_prev else 'FLAT'
+def ema(values: np.ndarray, period: int) -> np.ndarray:
+    if len(values) < period:
+        return np.full_like(values, np.nan)
+    alpha = 2 / (period + 1)
+    out = np.empty_like(values)
+    out[:] = np.nan
+    out[0] = values[0]
+    for i in range(1, len(values)):
+        out[i] = alpha * values[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+def rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
+    if len(close) < period + 1:
+        return np.full_like(close, np.nan)
+    delta = np.diff(close, prepend=close[0])
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+
+    # Wilder smoothing
+    avg_gain = np.empty_like(close); avg_gain[:] = np.nan
+    avg_loss = np.empty_like(close); avg_loss[:] = np.nan
+    avg_gain[period] = gain[1:period+1].mean()
+    avg_loss[period] = loss[1:period+1].mean()
+
+    for i in range(period + 1, len(close)):
+        avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gain[i]) / period
+        avg_loss[i] = (avg_loss[i - 1] * (period - 1) + loss[i]) / period
+
+    rs = avg_gain / (avg_loss + 1e-12)
+    out = 100 - (100 / (1 + rs))
+    return out
+
+
+def stoch_kd(high: np.ndarray, low: np.ndarray, close: np.ndarray, k_period: int = 14, d_period: int = 3):
+    n = len(close)
+    k = np.full(n, np.nan)
+    for i in range(k_period - 1, n):
+        hh = np.max(high[i - k_period + 1:i + 1])
+        ll = np.min(low[i - k_period + 1:i + 1])
+        rng = (hh - ll) if (hh - ll) != 0 else 1e-12
+        k[i] = 100 * (close[i] - ll) / rng
+    # D = SMA of K
+    d = np.full(n, np.nan)
+    for i in range(d_period - 1, n):
+        window = k[i - d_period + 1:i + 1]
+        if np.any(np.isnan(window)):
+            continue
+        d[i] = window.mean()
+    return k, d
+
+
+def true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
+    prev_close = np.roll(close, 1)
+    prev_close[0] = close[0]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev_close), np.abs(low - prev_close)))
+    return tr
+
+
+def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    n = len(close)
+    if n < period + 2:
+        return np.full(n, np.nan)
+
+    up_move = high - np.roll(high, 1)
+    down_move = np.roll(low, 1) - low
+    up_move[0] = 0.0
+    down_move[0] = 0.0
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = true_range(high, low, close)
+
+    # Wilder smoothing
+    def wilder_smooth(x: np.ndarray, p: int) -> np.ndarray:
+        out = np.full_like(x, np.nan)
+        out[p] = np.sum(x[1:p+1])
+        for i in range(p + 1, len(x)):
+            out[i] = out[i - 1] - (out[i - 1] / p) + x[i]
+        return out
+
+    atr = wilder_smooth(tr, period)
+    p_dm = wilder_smooth(plus_dm, period)
+    m_dm = wilder_smooth(minus_dm, period)
+
+    plus_di = 100 * (p_dm / (atr + 1e-12))
+    minus_di = 100 * (m_dm / (atr + 1e-12))
+    dx = 100 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
+
+    adx_out = np.full(n, np.nan)
+    # first ADX value is average of DX over period
+    start = period * 2
+    if start < n:
+        adx_out[start] = np.nanmean(dx[period+1:start+1])
+        for i in range(start + 1, n):
+            adx_out[i] = ((adx_out[i - 1] * (period - 1)) + dx[i]) / period
+    return adx_out
+
+
+# -----------------------------
+# Strategy logic (no pandas)
+# -----------------------------
+def detect_trend(h1_candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    close = _arr(h1_candles, "close")
+    high = _arr(h1_candles, "high")
+    low = _arr(h1_candles, "low")
+
+    ema50 = ema(close, 50)
+    ema200 = ema(close, 200)
+    adx14 = adx(high, low, close, 14)
+
+    i = len(close) - 1
+    bullish = ema50[i] > ema200[i]
+    strong = (not np.isnan(adx14[i])) and (adx14[i] >= 18)  # mild strength
+
+    direction = "BUY" if bullish else "SELL"
+    return {"direction": direction, "strong": strong, "adx": float(adx14[i]) if not np.isnan(adx14[i]) else None}
+
+
+def m15_confirms(m15_candles: List[Dict[str, Any]], direction: str) -> bool:
+    # Simple structure confirmation: last 3 closes aligned
+    close = _arr(m15_candles, "close")
+    if len(close) < 5:
+        return False
+    last = close[-1]
+    prev1 = close[-2]
+    prev2 = close[-3]
+
+    if direction == "BUY":
+        return (last > prev1) and (prev1 > prev2)
     else:
-        slope = 'FLAT'
+        return (last < prev1) and (prev1 < prev2)
 
-    direction = 'NEUTRAL'
-    if c > es_now and ef_now > es_now and slope == 'UP':
-        direction = 'BULL'
-    elif c < es_now and ef_now < es_now and slope == 'DOWN':
-        direction = 'BEAR'
 
-    return TrendState(
-        timeframe=timeframe,
-        direction=direction,
-        ema_fast=ef_now,
-        ema_slow=es_now,
-        close=c,
-        slope=slope,
+def risk_tag_from_context(trend_info: Dict[str, Any]) -> str:
+    # Simple tag
+    if trend_info.get("strong"):
+        return "A+"
+    return "B"
+
+
+def score_entry_m5(m5_candles: List[Dict[str, Any]], direction: str) -> Dict[str, Any]:
+    close = _arr(m5_candles, "close")
+    high = _arr(m5_candles, "high")
+    low = _arr(m5_candles, "low")
+
+    r = rsi(close, 14)
+    k, d = stoch_kd(high, low, close, 14, 3)
+
+    i = len(close) - 1
+    if np.isnan(r[i]) or np.isnan(k[i]) or np.isnan(d[i]):
+        return {"ok": False, "score": 0.0, "why": "Not enough data"}
+
+    score = 0.0
+    reasons = []
+
+    # Trend-friendly oscillator logic
+    if direction == "BUY":
+        if r[i] >= 45:
+            score += 1.0; reasons.append("RSI ok")
+        if k[i] > d[i] and k[i] < 80:
+            score += 1.0; reasons.append("Stoch cross up")
+    else:
+        if r[i] <= 55:
+            score += 1.0; reasons.append("RSI ok")
+        if k[i] < d[i] and k[i] > 20:
+            score += 1.0; reasons.append("Stoch cross down")
+
+    ok = score >= 1.5
+    return {"ok": ok, "score": float(score), "why": ", ".join(reasons) if reasons else "No trigger"}
+
+
+def build_signal(symbol: str,
+                 direction: str,
+                 h1: List[Dict[str, Any]],
+                 m15: List[Dict[str, Any]],
+                 m5: List[Dict[str, Any]]) -> Optional[Signal]:
+
+    trend = detect_trend(h1)
+    if trend["direction"] != direction:
+        direction = trend["direction"]
+
+    if not trend["strong"]:
+        return None
+    if not m15_confirms(m15, direction):
+        return None
+
+    trig = score_entry_m5(m5, direction)
+    if not trig["ok"]:
+        return None
+
+    # Basic SL/TP using last swing range on M5
+    close = _arr(m5, "close")
+    high = _arr(m5, "high")
+    low = _arr(m5, "low")
+    entry = float(close[-1])
+
+    recent_range = float(np.nanmax(high[-20:]) - np.nanmin(low[-20:])) if len(close) >= 20 else float(high[-1] - low[-1])
+    recent_range = max(recent_range, 0.5)  # avoid zero
+
+    if direction == "BUY":
+        sl = entry - 0.8 * recent_range
+        tp1 = entry + 1.0 * recent_range
+        tp2 = entry + 1.8 * recent_range
+    else:
+        sl = entry + 0.8 * recent_range
+        tp1 = entry - 1.0 * recent_range
+        tp2 = entry - 1.8 * recent_range
+
+    reason = f"H1 {trend['direction']} strong (ADX={trend.get('adx')}), M15 confirms, M5 trigger: {trig['why']}"
+    return Signal(
+        symbol=symbol,
+        side=direction,
+        entry=entry,
+        sl=float(sl),
+        tp1=float(tp1),
+        tp2=float(tp2),
+        reason=reason,
+        score=float(trig["score"]),
+        risk_tag=risk_tag_from_context(trend),
     )
-
-
-def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast_p: int, rsi_period: int) -> tuple[bool, str]:
-    close = df_m15['close']
-    ef = ema(close, ema_fast_p)
-    r = rsi(close, rsi_period)
-    c = float(close.iloc[-1])
-    ef_now = float(ef.iloc[-1])
-    r_now = float(r.iloc[-1])
-
-    if trend_dir == 'BULL':
-        ok = (c > ef_now) or (r_now > 50)
-        reason = f"M15 confirm: close>{ema_fast_p}EMA" if c > ef_now else "M15 confirm: RSI>50" if r_now > 50 else "M15 confirm failed"
-        return ok, reason
-    if trend_dir == 'BEAR':
-        ok = (c < ef_now) or (r_now < 50)
-        reason = f"M15 confirm: close<{ema_fast_p}EMA" if c < ef_now else "M15 confirm: RSI<50" if r_now < 50 else "M15 confirm failed"
-        return ok, reason
-    return False, "M15 confirm: HTF neutral"
-
-
-def score_entry_m5(
-    df_m5: pd.DataFrame,
-    direction: str,
-    cfg,
-) -> tuple[list[str], float, bool, list[str]]:
-    """Return (confirmations_passed_labels, adx_value, adx_pass, reason_bullets)."""
-    close = df_m5['close']
-    high = df_m5['high']
-    low = df_m5['low']
-    open_ = df_m5['open']
-
-    mid, upper, lower = bollinger_bands(close, cfg.bb_period, cfg.bb_std)
-    r = rsi(close, cfg.rsi_period)
-    k, d = stoch_oscillator(high, low, close, cfg.stoch_k, cfg.stoch_d, cfg.stoch_smooth)
-    a = adx(high, low, close, cfg.adx_period)
-
-    adx_val = float(a.iloc[-1])
-    adx_pass = adx_val >= cfg.adx_min
-
-    conf: list[str] = []
-    reasons: list[str] = []
-
-    # Group A: Bollinger
-    c_now = float(close.iloc[-1])
-    c_prev = float(close.iloc[-2])
-    lower_now = float(lower.iloc[-1])
-    upper_now = float(upper.iloc[-1])
-    mid_now = float(mid.iloc[-1])
-
-    if direction == 'BUY':
-        if (c_prev < lower_now and c_now > lower_now) or (c_now < mid_now and c_now > lower_now and c_now > c_prev):
-            conf.append('BB')
-            reasons.append('Bollinger: lower-band rejection / pullback end')
-    else:
-        if (c_prev > upper_now and c_now < upper_now) or (c_now > mid_now and c_now < upper_now and c_now < c_prev):
-            conf.append('BB')
-            reasons.append('Bollinger: upper-band rejection / pullback end')
-
-    # Group B: RSI
-    r_now = float(r.iloc[-1])
-    r_prev = float(r.iloc[-2])
-    if direction == 'BUY':
-        if (r_prev <= 50 and r_now > 50) or (r.tail(10).min() < cfg.rsi_buy_min and r_now > r_prev):
-            conf.append('RSI')
-            reasons.append('RSI: momentum rebound / crossed above 50')
-    else:
-        if (r_prev >= 50 and r_now < 50) or (r.tail(10).max() > cfg.rsi_sell_max and r_now < r_prev):
-            conf.append('RSI')
-            reasons.append('RSI: momentum fade / crossed below 50')
-
-    # Group C: Stochastic
-    k_now = float(k.iloc[-1])
-    d_now = float(d.iloc[-1])
-    k_prev = float(k.iloc[-2])
-    d_prev = float(d.iloc[-2])
-
-    if direction == 'BUY':
-        crossed_up = (k_prev <= d_prev) and (k_now > d_now)
-        if crossed_up and (k_now < cfg.stoch_oversold or k_prev < 30):
-            conf.append('STOCH')
-            reasons.append('Stoch: cross up from oversold / rising')
-    else:
-        crossed_down = (k_prev >= d_prev) and (k_now < d_now)
-        if crossed_down and (k_now > cfg.stoch_overbought or k_prev > 70):
-            conf.append('STOCH')
-            reasons.append('Stoch: cross down from overbought / falling')
-
-    # Group D: Candlestick (basic)
-    o_now = float(open_.iloc[-1])
-    o_prev = float(open_.iloc[-2])
-    h_now = float(high.iloc[-1])
-    l_now = float(low.iloc[-1])
-
-    body_now = abs(c_now - o_now)
-    body_prev = abs(c_prev - o_prev)
-    upper_wick = h_now - max(c_now, o_now)
-    lower_wick = min(c_now, o_now) - l_now
-
-    bullish_engulf = (c_now > o_now) and (c_prev < o_prev) and (c_now >= o_prev) and (o_now <= c_prev)
-    bearish_engulf = (c_now < o_now) and (c_prev > o_prev) and (o_now >= c_prev) and (c_now <= o_prev)
-
-    # Pinbar-ish: long wick relative to body
-    pin_bull = (lower_wick > body_now * 2) and (c_now > o_now)
-    pin_bear = (upper_wick > body_now * 2) and (c_now < o_now)
-
-    if direction == 'BUY':
-        if bullish_engulf or pin_bull:
-            conf.append('CANDLE')
-            reasons.append('Candle: bullish engulf / pin bar')
-    else:
-        if bearish_engulf or pin_bear:
-            conf.append('CANDLE')
-            reasons.append('Candle: bearish engulf / pin bar')
-
-    # Build reason bullets (only true conditions)
-    reason_bullets = []
-    for rtxt in reasons:
-        reason_bullets.append(rtxt)
-
-    # Always include ADX bullet
-    reason_bullets.append(f"ADX {adx_val:.1f} {'>=' if adx_pass else '<'} {cfg.adx_min} (trend strength)")
-
-    return conf, adx_val, adx_pass, reason_bullets
-
-
-def risk_tag_from_context(trend_timeframe: str) -> str:
-    # Simple default: if H1 trend is present, treat as SWING-ish; if fallback M15-only trend, treat as SCALP
-    return "SWING" if trend_timeframe == "1h" else "SCALP"
