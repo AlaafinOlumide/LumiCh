@@ -5,33 +5,27 @@ from typing import List
 
 @dataclass
 class Config:
-    # ===== API KEYS =====
+    # ===== Required secrets =====
     TWELVEDATA_API_KEY: str
     TELEGRAM_BOT_TOKEN: str
     TELEGRAM_CHAT_ID: str
 
-    # ===== SYMBOL & TIMEFRAMES =====
+    # ===== Core =====
     SYMBOL: str = "XAUUSD"
-    M5_INTERVAL: str = "5min"
-    M15_INTERVAL: str = "15min"
-    H1_INTERVAL: str = "1h"
+    LOG_LEVEL: str = "INFO"
 
-    # ===== TRADING SESSIONS (GMT) =====
-    SESSION_1_START: int = 0     # 00:00
-    SESSION_1_END: int = 3       # 03:00
-    SESSION_2_START: int = 7     # 07:00
-    SESSION_2_END: int = 11      # 11:00
-    SESSION_3_START: int = 12    # 12:00
-    SESSION_3_END: int = 20      # 20:00
+    # ===== Trading sessions (what main.py expects) =====
+    # Format: "HH:MM-HH:MM" in GMT/UTC
+    trading_sessions: List[str] = None  # will be set in from_env()
 
-    # ===== RISK RULES (EQUITY EDGE SAFE) =====
+    # ===== Risk rules =====
     RISK_PER_TRADE_PCT: float = 0.25
     MAX_DAILY_LOSS_PCT: float = 3.0
     MAX_TOTAL_DRAWDOWN_PCT: float = 10.0
     MAX_TRADES_PER_DAY: int = 3
     COOLDOWN_MINUTES: int = 30
 
-    # ===== STRATEGY SETTINGS =====
+    # ===== Strategy params (optional / safe defaults) =====
     RSI_PERIOD: int = 14
     STOCH_K: int = 14
     STOCH_D: int = 3
@@ -39,20 +33,24 @@ class Config:
     BB_PERIOD: int = 20
     BB_STDDEV: float = 2.0
 
-    # ===== LOGGING =====
-    LOG_LEVEL: str = "INFO"
-
     @classmethod
     def from_env(cls):
         """
-        Load config safely from environment variables (Render compatible)
+        Render-friendly config loader.
+        Supports either:
+          - TRADING_SESSIONS="00:00-03:00,07:00-11:00,12:00-20:00"
+        or defaults to the sessions above.
         """
 
-        def get_env(name: str, default=None, required=False):
+        def get_env(name: str, default=None, required: bool = False):
             value = os.getenv(name, default)
-            if required and not value:
+            if required and (value is None or str(value).strip() == ""):
                 raise RuntimeError(f"Missing required environment variable: {name}")
             return value
+
+        # Sessions: env override or default
+        sessions_raw = get_env("TRADING_SESSIONS", "00:00-03:00,07:00-11:00,12:00-20:00")
+        sessions_list = [s.strip() for s in sessions_raw.split(",") if s.strip()]
 
         return cls(
             TWELVEDATA_API_KEY=get_env("TWELVEDATA_API_KEY", required=True),
@@ -61,6 +59,8 @@ class Config:
 
             SYMBOL=get_env("SYMBOL", "XAUUSD"),
             LOG_LEVEL=get_env("LOG_LEVEL", "INFO"),
+
+            trading_sessions=sessions_list,
 
             RISK_PER_TRADE_PCT=float(get_env("RISK_PER_TRADE_PCT", 0.25)),
             MAX_DAILY_LOSS_PCT=float(get_env("MAX_DAILY_LOSS_PCT", 3.0)),
