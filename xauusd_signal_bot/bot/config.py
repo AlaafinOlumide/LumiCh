@@ -16,7 +16,7 @@ class Config:
 
     # ===== Trading sessions (what main.py expects) =====
     # Format: "HH:MM-HH:MM" in GMT/UTC
-    trading_sessions: List[str] = None  # will be set in from_env()
+    trading_sessions: str = "00:00-03:00,07:00-11:00,12:00-20:00"  # will be set in from_env()
 
     # ===== Risk rules =====
     RISK_PER_TRADE_PCT: float = 0.25
