@@ -1,103 +1,70 @@
 import os
 from dataclasses import dataclass
+from typing import List
 
 
-def _getenv(name: str, default: str | None = None) -> str | None:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    return v
-
-
-def _getint(name: str, default: int) -> int:
-    v = _getenv(name)
-    if v is None:
-        return default
-    try:
-        return int(v)
-    except ValueError:
-        return default
-
-
-def _getfloat(name: str, default: float) -> float:
-    v = _getenv(name)
-    if v is None:
-        return default
-    try:
-        return float(v)
-    except ValueError:
-        return default
-
-
-@dataclass(frozen=True)
+@dataclass
 class Config:
-    symbol: str
-    twelvedata_api_key: str
+    # ===== API KEYS =====
+    TWELVEDATA_API_KEY: str
+    TELEGRAM_BOT_TOKEN: str
+    TELEGRAM_CHAT_ID: str
 
-    telegram_bot_token: str
-    telegram_chat_id: str
+    # ===== SYMBOL & TIMEFRAMES =====
+    SYMBOL: str = "XAUUSD"
+    M5_INTERVAL: str = "5min"
+    M15_INTERVAL: str = "15min"
+    H1_INTERVAL: str = "1h"
 
-    trading_sessions: str
+    # ===== TRADING SESSIONS (GMT) =====
+    SESSION_1_START: int = 0     # 00:00
+    SESSION_1_END: int = 3       # 03:00
+    SESSION_2_START: int = 7     # 07:00
+    SESSION_2_END: int = 11      # 11:00
+    SESSION_3_START: int = 12    # 12:00
+    SESSION_3_END: int = 20      # 20:00
 
-    min_confirmations: int
-    adx_min: float
-    cooldown_minutes: int
-    poll_seconds: int
+    # ===== RISK RULES (EQUITY EDGE SAFE) =====
+    RISK_PER_TRADE_PCT: float = 0.25
+    MAX_DAILY_LOSS_PCT: float = 3.0
+    MAX_TOTAL_DRAWDOWN_PCT: float = 10.0
+    MAX_TRADES_PER_DAY: int = 3
+    COOLDOWN_MINUTES: int = 30
 
-    ema_fast: int
-    ema_slow: int
-    ema_slope_bars: int
+    # ===== STRATEGY SETTINGS =====
+    RSI_PERIOD: int = 14
+    STOCH_K: int = 14
+    STOCH_D: int = 3
+    ADX_PERIOD: int = 14
+    BB_PERIOD: int = 20
+    BB_STDDEV: float = 2.0
 
-    rsi_period: int
-    stoch_k: int
-    stoch_d: int
-    stoch_smooth: int
-    stoch_oversold: float
-    stoch_overbought: float
-    bb_period: int
-    bb_std: float
-    adx_period: int
+    # ===== LOGGING =====
+    LOG_LEVEL: str = "INFO"
 
-    news_mode: str
-    news_api_provider: str
-    news_api_key: str
-    news_base_url: str | None
-    news_lookahead_min: int
-    news_cooldown_after_min: int
+    @classmethod
+    def from_env(cls):
+        """
+        Load config safely from environment variables (Render compatible)
+        """
 
+        def get_env(name: str, default=None, required=False):
+            value = os.getenv(name, default)
+            if required and not value:
+                raise RuntimeError(f"Missing required environment variable: {name}")
+            return value
 
-def load_config() -> Config:
-    symbol = _getenv("SYMBOL", "XAU/USD")
-    td_key = _getenv("TWELVEDATA_API_KEY", "")
-    tg_token = _getenv("TELEGRAM_BOT_TOKEN", "")
-    tg_chat = _getenv("TELEGRAM_CHAT_ID", "")
+        return cls(
+            TWELVEDATA_API_KEY=get_env("TWELVEDATA_API_KEY", required=True),
+            TELEGRAM_BOT_TOKEN=get_env("TELEGRAM_BOT_TOKEN", required=True),
+            TELEGRAM_CHAT_ID=get_env("TELEGRAM_CHAT_ID", required=True),
 
-    return Config(
-        symbol=symbol,
-        twelvedata_api_key=td_key,
-        telegram_bot_token=tg_token,
-        telegram_chat_id=tg_chat,
-        trading_sessions=_getenv("TRADING_SESSIONS", "00:00-03:00,07:00-11:00,12:00-20:00"),
-        min_confirmations=_getint("MIN_CONFIRMATIONS", 2),
-        adx_min=_getfloat("ADX_MIN", 18.0),
-        cooldown_minutes=_getint("COOLDOWN_MINUTES", 20),
-        poll_seconds=_getint("POLL_SECONDS", 60),
-        ema_fast=_getint("EMA_FAST", 50),
-        ema_slow=_getint("EMA_SLOW", 200),
-        ema_slope_bars=_getint("EMA_SLOPE_BARS", 10),
-        rsi_period=_getint("RSI_PERIOD", 14),
-        stoch_k=_getint("STOCH_K", 14),
-        stoch_d=_getint("STOCH_D", 3),
-        stoch_smooth=_getint("STOCH_SMOOTH", 3),
-        stoch_oversold=_getfloat("STOCH_OVERSOLD", 20.0),
-        stoch_overbought=_getfloat("STOCH_OVERBOUGHT", 80.0),
-        bb_period=_getint("BB_PERIOD", 20),
-        bb_std=_getfloat("BB_STD", 2.0),
-        adx_period=_getint("ADX_PERIOD", 14),
-        news_mode=(_getenv("NEWS_MODE", "WARN") or "WARN").upper(),
-        news_api_provider=_getenv("NEWS_API_PROVIDER", "fmp"),
-        news_api_key=_getenv("NEWS_API_KEY", ""),
-        news_base_url=_getenv("NEWS_BASE_URL", None),
-        news_lookahead_min=_getint("NEWS_LOOKAHEAD_MIN", 60),
-        news_cooldown_after_min=_getint("NEWS_COOLDOWN_AFTER_MIN", 30),
-    )
+            SYMBOL=get_env("SYMBOL", "XAUUSD"),
+            LOG_LEVEL=get_env("LOG_LEVEL", "INFO"),
+
+            RISK_PER_TRADE_PCT=float(get_env("RISK_PER_TRADE_PCT", 0.25)),
+            MAX_DAILY_LOSS_PCT=float(get_env("MAX_DAILY_LOSS_PCT", 3.0)),
+            MAX_TOTAL_DRAWDOWN_PCT=float(get_env("MAX_TOTAL_DRAWDOWN_PCT", 10.0)),
+            MAX_TRADES_PER_DAY=int(get_env("MAX_TRADES_PER_DAY", 3)),
+            COOLDOWN_MINUTES=int(get_env("COOLDOWN_MINUTES", 30)),
+        )
