@@ -17,11 +17,13 @@ class Config:
     symbol: str = "XAUUSD"
 
     # ===== Trading Sessions =====
-    # MUST be a STRING because parse_sessions() uses .split(",")
+    # MUST stay a string (parse_sessions uses .split)
     trading_sessions: str = "00:00-03:00,07:00-11:00,12:00-20:00"
 
-    # ===== APIs =====
+    # ===== Market Data =====
     twelvedata_api_key: str = ""
+
+    # ===== Telegram =====
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
@@ -29,16 +31,18 @@ class Config:
     news_api_provider: str = "fmp"
     news_api_key: str = ""
     news_base_url: str = ""
-    news_lookahead_min: int = 60  # <-- FIX: main.py expects this
+
+    # Minutes BEFORE high-impact news to block trades
+    news_lookahead_min: int = 60
+
+    # Minutes AFTER high-impact news to block trades
+    news_cooldown_after_min: int = 30  # ✅ FIX
 
     # ===== Runtime =====
     poll_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "Config":
-        """
-        Load config from environment variables (Render compatible)
-        """
         return cls(
             symbol=get_env("SYMBOL", "XAUUSD"),
 
@@ -48,13 +52,16 @@ class Config:
             ),
 
             twelvedata_api_key=get_env("TWELVEDATA_API_KEY", ""),
+
             telegram_bot_token=get_env("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=get_env("TELEGRAM_CHAT_ID", ""),
 
             news_api_provider=get_env("NEWS_API_PROVIDER", "fmp"),
             news_api_key=get_env("NEWS_API_KEY", ""),
             news_base_url=get_env("NEWS_BASE_URL", ""),
-            news_lookahead_min=int(get_env("NEWS_LOOKAHEAD_MIN", 60)),  # <-- FIX
+
+            news_lookahead_min=int(get_env("NEWS_LOOKAHEAD_MIN", 60)),
+            news_cooldown_after_min=int(get_env("NEWS_COOLDOWN_AFTER_MIN", 30)),
 
             poll_seconds=int(get_env("POLL_SECONDS", 60)),
         )
