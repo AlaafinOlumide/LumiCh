@@ -1,63 +1,57 @@
-import os
+# bot/config.py
+
 from dataclasses import dataclass
+import os
+
+
+def get_env(name: str, default=None):
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value
 
 
 @dataclass
 class Config:
-    # ===== Required secrets (match what main.py expects) =====
-    twelvedata_api_key: str
-    telegram_bot_token: str
-    telegram_chat_id: str
-
     # ===== Core =====
     symbol: str = "XAUUSD"
-    log_level: str = "INFO"
 
-    # ===== Trading sessions (string for sessions.py) =====
+    # ===== Trading Sessions =====
+    # MUST be a STRING because parse_sessions() calls .split(",")
     trading_sessions: str = "00:00-03:00,07:00-11:00,12:00-20:00"
 
-    # ===== News filter + polling (missing fields) =====
+    # ===== APIs =====
+    twelvedata_api_key: str = ""
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+    # ===== News Filter =====
     news_api_provider: str = "fmp"
+    news_api_key: str = ""
+
+    # ===== Runtime =====
     poll_seconds: int = 60
 
-    # ===== Risk rules =====
-    risk_per_trade_pct: float = 0.25
-    max_daily_loss_pct: float = 3.0
-    max_total_drawdown_pct: float = 10.0
-    max_trades_per_day: int = 3
-    cooldown_minutes: int = 30
-
-    # ===== Strategy params =====
-    rsi_period: int = 14
-    stoch_k: int = 14
-    stoch_d: int = 3
-    adx_period: int = 14
-    bb_period: int = 20
-    bb_stddev: float = 2.0
-
     @classmethod
-    def from_env(cls):
-        def get_env(name: str, default=None, required: bool = False):
-            value = os.getenv(name, default)
-            if required and (value is None or str(value).strip() == ""):
-                raise RuntimeError(f"Missing required environment variable: {name}")
-            return value
+    def from_env(cls) -> "Config":
+        """
+        Load config from environment variables (Render compatible)
+        """
 
         return cls(
-            twelvedata_api_key=get_env("TWELVEDATA_API_KEY", required=True),
-            telegram_bot_token=get_env("TELEGRAM_BOT_TOKEN", required=True),
-            telegram_chat_id=get_env("TELEGRAM_CHAT_ID", required=True),
-
             symbol=get_env("SYMBOL", "XAUUSD"),
-            log_level=get_env("LOG_LEVEL", "INFO"),
-            trading_sessions=get_env("TRADING_SESSIONS", "00:00-03:00,07:00-11:00,12:00-20:00"),
+
+            trading_sessions=get_env(
+                "TRADING_SESSIONS",
+                "00:00-03:00,07:00-11:00,12:00-20:00"
+            ),
+
+            twelvedata_api_key=get_env("TWELVEDATA_API_KEY", ""),
+            telegram_bot_token=get_env("TELEGRAM_BOT_TOKEN", ""),
+            telegram_chat_id=get_env("TELEGRAM_CHAT_ID", ""),
 
             news_api_provider=get_env("NEWS_API_PROVIDER", "fmp"),
-            poll_seconds=int(get_env("POLL_SECONDS", 60)),
+            news_api_key=get_env("NEWS_API_KEY", ""),
 
-            risk_per_trade_pct=float(get_env("RISK_PER_TRADE_PCT", 0.25)),
-            max_daily_loss_pct=float(get_env("MAX_DAILY_LOSS_PCT", 3.0)),
-            max_total_drawdown_pct=float(get_env("MAX_TOTAL_DRAWDOWN_PCT", 10.0)),
-            max_trades_per_day=int(get_env("MAX_TRADES_PER_DAY", 3)),
-            cooldown_minutes=int(get_env("COOLDOWN_MINUTES", 30)),
+            poll_seconds=int(get_env("POLL_SECONDS", 60)),
         )
