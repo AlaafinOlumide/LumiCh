@@ -17,7 +17,7 @@ class Config:
     symbol: str = "XAUUSD"
 
     # ===== Trading Sessions =====
-    # MUST be a STRING because parse_sessions() calls .split(",")
+    # MUST be a STRING because parse_sessions() uses .split(",")
     trading_sessions: str = "00:00-03:00,07:00-11:00,12:00-20:00"
 
     # ===== APIs =====
@@ -28,6 +28,7 @@ class Config:
     # ===== News Filter =====
     news_api_provider: str = "fmp"
     news_api_key: str = ""
+    news_base_url: str = ""  # <-- FIX: main.py expects this
 
     # ===== Runtime =====
     poll_seconds: int = 60
@@ -37,7 +38,6 @@ class Config:
         """
         Load config from environment variables (Render compatible)
         """
-
         return cls(
             symbol=get_env("SYMBOL", "XAUUSD"),
 
@@ -52,6 +52,7 @@ class Config:
 
             news_api_provider=get_env("NEWS_API_PROVIDER", "fmp"),
             news_api_key=get_env("NEWS_API_KEY", ""),
+            news_base_url=get_env("NEWS_BASE_URL", ""),  # <-- FIX
 
             poll_seconds=int(get_env("POLL_SECONDS", 60)),
         )
