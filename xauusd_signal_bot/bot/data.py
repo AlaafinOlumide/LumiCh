@@ -1,54 +1,53 @@
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
-
-import pandas as pd
+import os
 import requests
-
-log = logging.getLogger(__name__)
-
-
-@dataclass
-class CandleData:
-    df: pd.DataFrame  # indexed by datetime (UTC)
-    interval: str
+from typing import List, Dict, Any
 
 
 class TwelveDataClient:
-    def __init__(self, api_key: str, base_url: str = 'https://api.twelvedata.com'):
-        self.api_key = api_key
-        self.base_url = base_url.rstrip('/')
+    def __init__(self, api_key: str | None = None):
+        self.api_key = api_key or os.getenv("TWELVEDATA_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("TWELVEDATA_API_KEY is required")
 
-    def fetch_time_series(self, symbol: str, interval: str, outputsize: int = 200) -> CandleData:
-        url = f'{self.base_url}/time_series'
+    def fetch_ohlcv(self, symbol: str, interval: str, outputsize: int = 300) -> List[Dict[str, Any]]:
+        """
+        Returns OHLCV as a list of dicts sorted oldest -> newest.
+        Each item: {"datetime","open","high","low","close","volume"}
+        """
+        url = "https://api.twelvedata.com/time_series"
         params = {
-            'symbol': symbol,
-            'interval': interval,
-            'outputsize': int(outputsize),
-            'format': 'JSON',
-            'apikey': self.api_key,
-            'order': 'ASC',
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": self.api_key,
+            "format": "JSON",
+            "timezone": "UTC",
         }
 
-        resp = requests.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
 
-        if isinstance(data, dict) and data.get('status') == 'error':
+        if data.get("status") == "error":
             raise RuntimeError(f"TwelveData error: {data.get('message')}")
 
-        values = data.get('values') if isinstance(data, dict) else None
+        values = data.get("values", [])
         if not values:
-            raise RuntimeError(f'No candle values returned (interval={interval})')
+            raise RuntimeError(f"No data returned for {symbol} {interval}")
 
-        df = pd.DataFrame(values)
-        df['datetime'] = pd.to_datetime(df['datetime'], utc=True, errors='coerce')
-        df = df.dropna(subset=['datetime']).set_index('datetime').sort_index()
+        # TwelveData returns newest -> oldest, so reverse
+        values = list(reversed(values))
 
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        df = df.dropna(subset=['open', 'high', 'low', 'close'])
-        return CandleData(df=df, interval=interval)
+        out: List[Dict[str, Any]] = []
+        for v in values:
+            out.append({
+                "datetime": v["datetime"],
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"]),
+                "volume": float(v.get("volume") or 0),
+            })
+        return out
