@@ -4,40 +4,38 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    # ===== Required secrets =====
-    TWELVEDATA_API_KEY: str
-    TELEGRAM_BOT_TOKEN: str
-    TELEGRAM_CHAT_ID: str
+    # ===== Required secrets (match what main.py expects) =====
+    twelvedata_api_key: str
+    telegram_bot_token: str
+    telegram_chat_id: str
 
     # ===== Core =====
-    SYMBOL: str = "XAUUSD"
-    LOG_LEVEL: str = "INFO"
+    symbol: str = "XAUUSD"
+    log_level: str = "INFO"
 
-    # ===== Trading sessions (string that sessions.py can split) =====
+    # ===== Trading sessions (string for sessions.py) =====
     # Format: "HH:MM-HH:MM,HH:MM-HH:MM,HH:MM-HH:MM" in GMT/UTC
     trading_sessions: str = "00:00-03:00,07:00-11:00,12:00-20:00"
 
     # ===== Risk rules =====
-    RISK_PER_TRADE_PCT: float = 0.25
-    MAX_DAILY_LOSS_PCT: float = 3.0
-    MAX_TOTAL_DRAWDOWN_PCT: float = 10.0
-    MAX_TRADES_PER_DAY: int = 3
-    COOLDOWN_MINUTES: int = 30
+    risk_per_trade_pct: float = 0.25
+    max_daily_loss_pct: float = 3.0
+    max_total_drawdown_pct: float = 10.0
+    max_trades_per_day: int = 3
+    cooldown_minutes: int = 30
 
-    # ===== Strategy params (optional / safe defaults) =====
-    RSI_PERIOD: int = 14
-    STOCH_K: int = 14
-    STOCH_D: int = 3
-    ADX_PERIOD: int = 14
-    BB_PERIOD: int = 20
-    BB_STDDEV: float = 2.0
+    # ===== Strategy params =====
+    rsi_period: int = 14
+    stoch_k: int = 14
+    stoch_d: int = 3
+    adx_period: int = 14
+    bb_period: int = 20
+    bb_stddev: float = 2.0
 
     @classmethod
     def from_env(cls):
         """
-        Render-friendly config loader.
-        TRADING_SESSIONS example:
-          "00:00-03:00,07:00-11:00,12:00-20:00"
+        Loads config from Render environment variables.
         """
 
         def get_env(name: str, default=None, required: bool = False):
@@ -46,21 +44,18 @@ class Config:
                 raise RuntimeError(f"Missing required environment variable: {name}")
             return value
 
-        sessions_raw = get_env("TRADING_SESSIONS", "00:00-03:00,07:00-11:00,12:00-20:00")
-
         return cls(
-            TWELVEDATA_API_KEY=get_env("TWELVEDATA_API_KEY", required=True),
-            TELEGRAM_BOT_TOKEN=get_env("TELEGRAM_BOT_TOKEN", required=True),
-            TELEGRAM_CHAT_ID=get_env("TELEGRAM_CHAT_ID", required=True),
+            twelvedata_api_key=get_env("TWELVEDATA_API_KEY", required=True),
+            telegram_bot_token=get_env("TELEGRAM_BOT_TOKEN", required=True),
+            telegram_chat_id=get_env("TELEGRAM_CHAT_ID", required=True),
 
-            SYMBOL=get_env("SYMBOL", "XAUUSD"),
-            LOG_LEVEL=get_env("LOG_LEVEL", "INFO"),
+            symbol=get_env("SYMBOL", "XAUUSD"),
+            log_level=get_env("LOG_LEVEL", "INFO"),
+            trading_sessions=get_env("TRADING_SESSIONS", "00:00-03:00,07:00-11:00,12:00-20:00"),
 
-            trading_sessions=sessions_raw,
-
-            RISK_PER_TRADE_PCT=float(get_env("RISK_PER_TRADE_PCT", 0.25)),
-            MAX_DAILY_LOSS_PCT=float(get_env("MAX_DAILY_LOSS_PCT", 3.0)),
-            MAX_TOTAL_DRAWDOWN_PCT=float(get_env("MAX_TOTAL_DRAWDOWN_PCT", 10.0)),
-            MAX_TRADES_PER_DAY=int(get_env("MAX_TRADES_PER_DAY", 3)),
-            COOLDOWN_MINUTES=int(get_env("COOLDOWN_MINUTES", 30)),
+            risk_per_trade_pct=float(get_env("RISK_PER_TRADE_PCT", 0.25)),
+            max_daily_loss_pct=float(get_env("MAX_DAILY_LOSS_PCT", 3.0)),
+            max_total_drawdown_pct=float(get_env("MAX_TOTAL_DRAWDOWN_PCT", 10.0)),
+            max_trades_per_day=int(get_env("MAX_TRADES_PER_DAY", 3)),
+            cooldown_minutes=int(get_env("COOLDOWN_MINUTES", 30)),
         )
