@@ -28,7 +28,8 @@ class Config:
     # ===== News Filter =====
     news_api_provider: str = "fmp"
     news_api_key: str = ""
-    news_base_url: str = ""  # <-- FIX: main.py expects this
+    news_base_url: str = ""
+    news_lookahead_min: int = 60  # <-- FIX: main.py expects this
 
     # ===== Runtime =====
     poll_seconds: int = 60
@@ -52,7 +53,8 @@ class Config:
 
             news_api_provider=get_env("NEWS_API_PROVIDER", "fmp"),
             news_api_key=get_env("NEWS_API_KEY", ""),
-            news_base_url=get_env("NEWS_BASE_URL", ""),  # <-- FIX
+            news_base_url=get_env("NEWS_BASE_URL", ""),
+            news_lookahead_min=int(get_env("NEWS_LOOKAHEAD_MIN", 60)),  # <-- FIX
 
             poll_seconds=int(get_env("POLL_SECONDS", 60)),
         )
