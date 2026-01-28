@@ -30,14 +30,13 @@ def _normalize_symbol_for_twelvedata(symbol: str | None) -> str:
         return "XAU/USD"
 
     s = symbol.strip().upper().replace(" ", "")
-    # If already in expected format
     if "/" in s:
         return s
 
     # Common input: XAUUSD -> XAU/USD
     if len(s) == 6 and s.isalnum():
         return f"{s[:3]}/{s[3:]}"
-    # Fallback: return original
+
     return s
 
 
@@ -87,8 +86,8 @@ def main() -> None:
 
     log = logging.getLogger("xauusd_bot")
 
-    # ✅ Fix: normalize symbol for TwelveData
-    cfg.symbol = _normalize_symbol_for_twelvedata(getattr(cfg, "symbol", None))
+    # ✅ FIX: Config is frozen; don't mutate it. Use a local normalized symbol.
+    symbol = _normalize_symbol_for_twelvedata(getattr(cfg, "symbol", None))
 
     sessions = parse_sessions(cfg.trading_sessions)
     if not sessions:
@@ -100,7 +99,7 @@ def main() -> None:
     last_signal_time: dt.datetime | None = None
     last_direction: str | None = None
 
-    log.info("Bot started. Sessions=%s | Symbol=%s", cfg.trading_sessions, cfg.symbol)
+    log.info("Bot started. Sessions=%s | Symbol=%s", cfg.trading_sessions, symbol)
 
     while True:
         try:
@@ -112,8 +111,7 @@ def main() -> None:
 
             s_label = session_label(sessions, now)
 
-            # ✅ Fix: Only run news check if a key is present.
-            # If key missing/empty, skip news blocking safely.
+            # News check (safe)
             news_status_text = "Normal"
             block_due_to_news = False
 
@@ -122,7 +120,6 @@ def main() -> None:
                 api_key = (cfg.news_api_key or "").strip()
 
                 if provider == "fmp" and not api_key:
-                    # No key -> skip to avoid 401 spam & hard failures
                     log.warning("NEWS_API_KEY is empty. Skipping news check (news_mode=%s).", cfg.news_mode)
                 else:
                     news = check_high_impact_news(
@@ -146,16 +143,16 @@ def main() -> None:
             # H1 trend (fallback to M15)
             trend_tf = "1h"
             try:
-                trend_df = td.fetch_time_series(cfg.symbol, "1h", outputsize=200).df
+                trend_df = td.fetch_time_series(symbol, "1h", outputsize=200).df
                 if len(trend_df) < 100:
                     raise RuntimeError("Insufficient H1 candles")
             except Exception as e:
                 log.warning("H1 unavailable (%s). Falling back to M15 as HTF.", e)
                 trend_tf = "15min"
-                trend_df = td.fetch_time_series(cfg.symbol, "15min", outputsize=200).df
+                trend_df = td.fetch_time_series(symbol, "15min", outputsize=200).df
 
-            df_m15 = td.fetch_time_series(cfg.symbol, "15min", outputsize=200).df
-            df_m5 = td.fetch_time_series(cfg.symbol, "5min", outputsize=200).df
+            df_m15 = td.fetch_time_series(symbol, "15min", outputsize=200).df
+            df_m5 = td.fetch_time_series(symbol, "5min", outputsize=200).df
 
             if len(df_m5) < 100 or len(df_m15) < 100 or len(trend_df) < 100:
                 log.info("Insufficient data. Sleeping.")
@@ -207,7 +204,7 @@ def main() -> None:
             risk_tag = risk_tag_from_context(trend_tf)
 
             sig = Signal(
-                symbol=cfg.symbol,
+                symbol=symbol,
                 timestamp_utc=now,
                 direction=direction,
                 risk_tag=risk_tag,
@@ -228,7 +225,7 @@ def main() -> None:
 
             last_signal_time = now
             last_direction = direction
-            log.info("Signal sent: %s %s", direction, cfg.symbol)
+            log.info("Signal sent: %s %s", direction, symbol)
 
         except Exception as e:
             logging.getLogger("xauusd_bot").exception("Loop error: %s", e)
