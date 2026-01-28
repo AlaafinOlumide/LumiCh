@@ -21,6 +21,26 @@ def setup_logging() -> None:
     )
 
 
+def _normalize_symbol_for_twelvedata(symbol: str | None) -> str:
+    """
+    TwelveData expects forex/metal pairs like 'XAU/USD', not 'XAUUSD'.
+    This normalizes common user inputs safely.
+    """
+    if not symbol:
+        return "XAU/USD"
+
+    s = symbol.strip().upper().replace(" ", "")
+    # If already in expected format
+    if "/" in s:
+        return s
+
+    # Common input: XAUUSD -> XAU/USD
+    if len(s) == 6 and s.isalnum():
+        return f"{s[:3]}/{s[3:]}"
+    # Fallback: return original
+    return s
+
+
 def fmt_signal(sig: Signal) -> str:
     ts = sig.timestamp_utc.strftime("%Y-%m-%d %H:%M")
     lines: list[str] = []
@@ -32,11 +52,17 @@ def fmt_signal(sig: Signal) -> str:
     t = sig.trend_state
     lines.append("*Trend (HTF)*")
     lines.append(f"- TF: `{t.timeframe}` | Dir: *{t.direction}* | Close: {t.close:.2f}")
-    lines.append(f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}")
+    lines.append(
+        f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}"
+    )
     lines.append("")
 
     lines.append("*Filters & Confirmations*")
-    lines.append(f"- Confirmations: *{sig.confirmations_passed}/{sig.confirmations_required}* (" + ", ".join(sig.confirmations) + ")")
+    lines.append(
+        f"- Confirmations: *{sig.confirmations_passed}/{sig.confirmations_required}* ("
+        + ", ".join(sig.confirmations)
+        + ")"
+    )
     lines.append(f"- ADX: {sig.adx_value:.1f} (min {sig.adx_min})")
     lines.append(f"- News: {sig.news_status}")
     lines.append("")
@@ -61,6 +87,9 @@ def main() -> None:
 
     log = logging.getLogger("xauusd_bot")
 
+    # ✅ Fix: normalize symbol for TwelveData
+    cfg.symbol = _normalize_symbol_for_twelvedata(getattr(cfg, "symbol", None))
+
     sessions = parse_sessions(cfg.trading_sessions)
     if not sessions:
         raise RuntimeError("No TRADING_SESSIONS configured")
@@ -71,7 +100,7 @@ def main() -> None:
     last_signal_time: dt.datetime | None = None
     last_direction: str | None = None
 
-    log.info("Bot started. Sessions=%s", cfg.trading_sessions)
+    log.info("Bot started. Sessions=%s | Symbol=%s", cfg.trading_sessions, cfg.symbol)
 
     while True:
         try:
@@ -83,22 +112,38 @@ def main() -> None:
 
             s_label = session_label(sessions, now)
 
-            # News check
-            news = check_high_impact_news(
-                provider=cfg.news_api_provider or "fmp",
-                api_key=cfg.news_api_key or "",
-                base_url=cfg.news_base_url,
-                lookahead_min=cfg.news_lookahead_min,
-                cooldown_after_min=cfg.news_cooldown_after_min,
-            )
-            if news.is_high_impact and cfg.news_mode == "BLOCK":
-                log.info("Signals blocked due to news: %s", news.message)
+            # ✅ Fix: Only run news check if a key is present.
+            # If key missing/empty, skip news blocking safely.
+            news_status_text = "Normal"
+            block_due_to_news = False
+
+            if (cfg.news_mode or "").upper() != "OFF":
+                provider = (cfg.news_api_provider or "fmp").strip().lower()
+                api_key = (cfg.news_api_key or "").strip()
+
+                if provider == "fmp" and not api_key:
+                    # No key -> skip to avoid 401 spam & hard failures
+                    log.warning("NEWS_API_KEY is empty. Skipping news check (news_mode=%s).", cfg.news_mode)
+                else:
+                    news = check_high_impact_news(
+                        provider=provider,
+                        api_key=api_key,
+                        base_url=cfg.news_base_url,
+                        lookahead_min=cfg.news_lookahead_min,
+                        cooldown_after_min=cfg.news_cooldown_after_min,
+                    )
+                    if news.is_high_impact:
+                        news_status_text = "⚠️ " + news.message
+                        if (cfg.news_mode or "").upper() == "BLOCK":
+                            block_due_to_news = True
+
+            if block_due_to_news:
+                log.info("Signals blocked due to news: %s", news_status_text)
                 time.sleep(cfg.poll_seconds)
                 continue
 
             # Fetch candles
             # H1 trend (fallback to M15)
-            trend_df = None
             trend_tf = "1h"
             try:
                 trend_df = td.fetch_time_series(cfg.symbol, "1h", outputsize=200).df
@@ -151,15 +196,15 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # Build reasons - include HTF & M15 reasons
             reasons = []
-            reasons.append(f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})")
+            reasons.append(
+                f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})"
+            )
             reasons.append(confirm_reason)
             reasons.extend(reason_bullets)
 
             tf_mode = "H1→M15→M5" if trend_tf == "1h" else "M15→M5 (fallback)"
             risk_tag = risk_tag_from_context(trend_tf)
-            news_status = ("⚠️ " + news.message) if news.is_high_impact else "Normal"
 
             sig = Signal(
                 symbol=cfg.symbol,
@@ -174,7 +219,7 @@ def main() -> None:
                 confirmations_required=cfg.min_confirmations,
                 adx_value=adx_val,
                 adx_min=cfg.adx_min,
-                news_status=news_status,
+                news_status=news_status_text,
                 reason_bullets=reasons,
             )
 
