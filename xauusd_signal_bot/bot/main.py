@@ -23,18 +23,10 @@ def setup_logging() -> None:
 
 
 def _confidence_from_confirmations(passed: int, required: int, adx_val: float, adx_min: float) -> str:
-    """
-    Simple confidence heuristic:
-    - HIGH if confirmations met + ADX clearly strong
-    - MEDIUM if confirmations met + ADX just above min
-    - LOW if barely met
-    """
     if required <= 0:
         return "MEDIUM"
 
     ratio = passed / required
-
-    # ADX strength buckets
     adx_strong = adx_val >= (adx_min + 10)
     adx_ok = adx_val >= adx_min
 
@@ -48,21 +40,6 @@ def _confidence_from_confirmations(passed: int, required: int, adx_val: float, a
 
 
 def fmt_signal(sig: Signal, entry_price: float, tp: Optional[float] = None, sl: Optional[float] = None) -> str:
-    """
-    Telegram template requested:
-    Xauusd: BUY/SELL
-    ENTRY PRICE
-    TP
-    SL
-    Confidence
-
-    2026-01-28 09:15 UTC | Session: *London*
-    Signal: *BUY* | Risk: *MEDIUM*
-    Mode: `H1→M15→M5`
-
-    *Trend (HTF)*
-    ...
-    """
     ts = sig.timestamp_utc.strftime("%Y-%m-%d %H:%M")
     confidence = _confidence_from_confirmations(
         passed=sig.confirmations_passed,
@@ -71,7 +48,6 @@ def fmt_signal(sig: Signal, entry_price: float, tp: Optional[float] = None, sl: 
         adx_min=sig.adx_min,
     )
 
-    # TP/SL text
     tp_txt = f"{tp:.2f}" if tp is not None else "TBD"
     sl_txt = f"{sl:.2f}" if sl is not None else "TBD"
 
@@ -113,6 +89,17 @@ def fmt_signal(sig: Signal, entry_price: float, tp: Optional[float] = None, sl: 
 cfg_global: Config
 
 
+def _log_dedupe(log: logging.Logger, key: str, message: str, dedupe_state: dict, every_seconds: int = 300) -> None:
+    """
+    Rate-limit repeated logs of the same reason.
+    """
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+    last_t = dedupe_state.get(key, 0.0)
+    if (now - last_t) >= every_seconds:
+        log.info(message)
+        dedupe_state[key] = now
+
+
 def main() -> None:
     global cfg_global
 
@@ -134,23 +121,29 @@ def main() -> None:
     last_signal_time: dt.datetime | None = None
     last_direction: str | None = None
 
+    # log dedupe state
+    dedupe_state: dict[str, float] = {}
+
     log.info("Bot started. Sessions=%s | Symbol=%s", cfg.trading_sessions, cfg.symbol)
 
     while True:
         try:
             now = dt.datetime.now(dt.timezone.utc)
 
-            # only work inside sessions
             if not now_in_sessions_utc(sessions, now):
-                log.info("Outside trading sessions. Sleeping %ss...", cfg.poll_seconds)
+                _log_dedupe(
+                    log,
+                    key="outside_sessions",
+                    message=f"Outside trading sessions. Sleeping {cfg.poll_seconds}s...",
+                    dedupe_state=dedupe_state,
+                    every_seconds=600,
+                )
                 time.sleep(cfg.poll_seconds)
                 continue
 
             s_label = session_label(sessions, now)
 
-            # -------------------------
-            # News (cached + soft-fail)
-            # -------------------------
+            # News check (soft-fail + cached inside)
             news = check_high_impact_news(
                 provider=cfg.news_api_provider or "fmp",
                 api_key=cfg.news_api_key or "",
@@ -158,60 +151,66 @@ def main() -> None:
                 lookahead_min=getattr(cfg, "news_lookahead_min", 60),
                 cooldown_after_min=getattr(cfg, "news_cooldown_after_min", 30),
                 now_utc=now,
-                ttl_seconds=300,  # max once per 5 mins
+                ttl_seconds=300,
             )
 
             if news.is_high_impact and cfg.news_mode == "BLOCK":
-                log.info("Signals blocked due to news: %s", news.message)
+                _log_dedupe(
+                    log,
+                    key="blocked_news",
+                    message=f"Signals blocked due to news: {news.message}",
+                    dedupe_state=dedupe_state,
+                    every_seconds=300,
+                )
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # -------------------------
-            # Fetch candles (CACHED)
-            # -------------------------
-            # Refresh rates:
-            # - 1h: 3600s
-            # - 15min: 900s
-            # - 5min: 300s
+            # Fetch candles (cached in client)
             try:
                 trend_tf = "1h"
-                trend_df = td.fetch_time_series_cached(
-                    cfg.symbol, "1h", outputsize=200, ttl_seconds=3600, now_utc=now
-                ).df
+                trend_df = td.fetch_time_series_cached(cfg.symbol, "1h", outputsize=200, ttl_seconds=3600, now_utc=now).df
                 if len(trend_df) < 100:
                     raise RuntimeError("Insufficient H1 candles")
             except Exception as e:
                 log.warning("H1 unavailable (%s). Falling back to M15 as HTF.", e)
                 trend_tf = "15min"
-                trend_df = td.fetch_time_series_cached(
-                    cfg.symbol, "15min", outputsize=200, ttl_seconds=900, now_utc=now
-                ).df
+                trend_df = td.fetch_time_series_cached(cfg.symbol, "15min", outputsize=200, ttl_seconds=900, now_utc=now).df
 
-            df_m15 = td.fetch_time_series_cached(
-                cfg.symbol, "15min", outputsize=200, ttl_seconds=900, now_utc=now
-            ).df
-
-            df_m5 = td.fetch_time_series_cached(
-                cfg.symbol, "5min", outputsize=200, ttl_seconds=300, now_utc=now
-            ).df
+            df_m15 = td.fetch_time_series_cached(cfg.symbol, "15min", outputsize=200, ttl_seconds=900, now_utc=now).df
+            df_m5 = td.fetch_time_series_cached(cfg.symbol, "5min", outputsize=200, ttl_seconds=300, now_utc=now).df
 
             if len(df_m5) < 100 or len(df_m15) < 100 or len(trend_df) < 100:
-                log.info("Insufficient data. Sleeping.")
+                _log_dedupe(
+                    log,
+                    key="insufficient_data",
+                    message="Insufficient data. Sleeping.",
+                    dedupe_state=dedupe_state,
+                    every_seconds=300,
+                )
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # -------------------------
-            # Trend + confirm + entry
-            # -------------------------
             trend = detect_trend(trend_df, trend_tf, cfg.ema_fast, cfg.ema_slow, cfg.ema_slope_bars)
             if trend.direction == "NEUTRAL":
-                log.info("HTF trend neutral. No signals.")
+                _log_dedupe(
+                    log,
+                    key="trend_neutral",
+                    message="HTF trend neutral. No signals.",
+                    dedupe_state=dedupe_state,
+                    every_seconds=300,
+                )
                 time.sleep(cfg.poll_seconds)
                 continue
 
             ok_confirm, confirm_reason = m15_confirms(df_m15, trend.direction, cfg.ema_fast, cfg.rsi_period)
             if not ok_confirm:
-                log.info("M15 did not confirm. %s", confirm_reason)
+                _log_dedupe(
+                    log,
+                    key="m15_not_confirm",
+                    message=f"M15 did not confirm. {confirm_reason}",
+                    dedupe_state=dedupe_state,
+                    every_seconds=180,
+                )
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -221,25 +220,51 @@ def main() -> None:
             if last_signal_time is not None:
                 mins_since = (now - last_signal_time).total_seconds() / 60
                 if mins_since < cfg.cooldown_minutes and last_direction == direction:
-                    log.info("Cooldown active (%.1f min). Skipping.", mins_since)
+                    _log_dedupe(
+                        log,
+                        key="cooldown",
+                        message=f"Cooldown active ({mins_since:.1f} min). Skipping.",
+                        dedupe_state=dedupe_state,
+                        every_seconds=180,
+                    )
                     time.sleep(cfg.poll_seconds)
                     continue
 
             confirmations, adx_val, adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
 
-            if not adx_pass:
-                log.info("ADX filter failed: %.1f < %.1f", adx_val, cfg.adx_min)
+            # ---------
+            # Smarter ADX gate to increase signals safely:
+            # If confirmations are strong, allow slightly lower ADX.
+            # ---------
+            strict_min = cfg.adx_min
+            relaxed_min = max(10.0, cfg.adx_min - 3.0)  # e.g., 20 -> 17
+            strong_conf = len(confirmations) >= (cfg.min_confirmations + 1)
+
+            effective_min = relaxed_min if strong_conf else strict_min
+            adx_ok = adx_val >= effective_min
+
+            if not adx_ok:
+                _log_dedupe(
+                    log,
+                    key="adx_failed",
+                    message=f"ADX filter failed: {adx_val:.1f} < {effective_min:.1f} (strict={strict_min:.1f}, strong_conf={strong_conf})",
+                    dedupe_state=dedupe_state,
+                    every_seconds=180,
+                )
                 time.sleep(cfg.poll_seconds)
                 continue
 
             if len(confirmations) < cfg.min_confirmations:
-                log.info("Not enough confirmations: %s (need %s)", len(confirmations), cfg.min_confirmations)
+                _log_dedupe(
+                    log,
+                    key="not_enough_confirm",
+                    message=f"Not enough confirmations: {len(confirmations)} (need {cfg.min_confirmations})",
+                    dedupe_state=dedupe_state,
+                    every_seconds=180,
+                )
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # -------------------------
-            # Build message
-            # -------------------------
             reasons: list[str] = []
             reasons.append(
                 f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})"
@@ -263,7 +288,7 @@ def main() -> None:
                 confirmations_passed=len(confirmations),
                 confirmations_required=cfg.min_confirmations,
                 adx_value=adx_val,
-                adx_min=cfg.adx_min,
+                adx_min=effective_min,  # show effective min in the message
                 news_status=news_status,
                 reason_bullets=reasons,
             )
@@ -274,32 +299,28 @@ def main() -> None:
             except Exception:
                 entry_price = float(trend.close)
 
-            # TP/SL placeholders (wire your ATR logic here if you have it in strategy)
             tp = None
             sl = None
 
-            msg = fmt_signal(sig, entry_price=entry_price, tp=tp, sl=sl)
-            tg.send_message(msg)
+            tg.send_message(fmt_signal(sig, entry_price=entry_price, tp=tp, sl=sl))
 
             last_signal_time = now
             last_direction = direction
             log.info("Signal sent: %s %s | entry=%.2f", direction, cfg.symbol, entry_price)
 
         except TwelveDataQuotaError:
-            # stop hammering TwelveData when daily credits are exhausted
-            logging.getLogger("xauusd_bot").error("TwelveData daily credits exhausted. Sleeping 3600s.")
+            log.error("TwelveData daily credits exhausted. Sleeping 3600s.")
             time.sleep(3600)
             continue
 
         except Exception as e:
-            # also catch quota message if it bubbles as generic error
             msg = str(e).lower()
             if "run out of api credits" in msg or "out of api credits" in msg:
-                logging.getLogger("xauusd_bot").error("API credits exhausted (generic). Sleeping 3600s.")
+                log.error("API credits exhausted (generic). Sleeping 3600s.")
                 time.sleep(3600)
                 continue
 
-            logging.getLogger("xauusd_bot").exception("Loop error: %s", e)
+            log.exception("Loop error: %s", e)
 
         time.sleep(cfg.poll_seconds)
 
