@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, List
-import pandas as pd
+from typing import Tuple
+
 import numpy as np
+import pandas as pd
 
 
 # =========================
@@ -93,7 +94,6 @@ def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """
     high = df["high"].astype(float)
     low = df["low"].astype(float)
-    close = df["close"].astype(float)
 
     up_move = high.diff()
     down_move = -low.diff()
@@ -101,8 +101,7 @@ def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    atr = _atr(df, period)
-    atr = atr.replace(0, np.nan)
+    atr = _atr(df, period).replace(0, np.nan)
 
     plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr)
     minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr)
@@ -125,8 +124,6 @@ def _is_bullish_engulfing(df: pd.DataFrame) -> bool:
         return False
     o1, c1 = float(df["open"].iloc[-2]), float(df["close"].iloc[-2])
     o2, c2 = float(df["open"].iloc[-1]), float(df["close"].iloc[-1])
-
-    # previous red, current green engulfing body
     return (c1 < o1) and (c2 > o2) and (o2 <= c1) and (c2 >= o1)
 
 
@@ -135,8 +132,6 @@ def _is_bearish_engulfing(df: pd.DataFrame) -> bool:
         return False
     o1, c1 = float(df["open"].iloc[-2]), float(df["close"].iloc[-2])
     o2, c2 = float(df["open"].iloc[-1]), float(df["close"].iloc[-1])
-
-    # previous green, current red engulfing body
     return (c1 > o1) and (c2 < o2) and (o2 >= c1) and (c2 <= o1)
 
 
@@ -172,7 +167,6 @@ def detect_trend(
     else:
         slope = "FLAT"
 
-    # direction logic
     if last_ef > last_es and slope == "UP":
         direction = "BULL"
     elif last_ef < last_es and slope == "DOWN":
@@ -213,7 +207,7 @@ def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period
 
 
 def risk_tag_from_context(trend_tf: str) -> str:
-    # simple: H1 trend = lower risk, fallback = medium, lower TF only = higher risk
+    # simple: H1 trend = medium, fallback = medium, lower TF only = high
     if trend_tf == "1h":
         return "MEDIUM"
     if trend_tf == "15min":
@@ -226,14 +220,13 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     Returns:
       confirmations(list[str]),
       adx_value(float),
-      adx_pass(bool),
+      adx_pass(bool)  -> STRICT pass against cfg.adx_min
       reason_bullets(list[str])
     """
     close = df_m5["close"].astype(float)
     ema_fast = _ema(close, cfg.ema_fast)
     rsi = _rsi(close, cfg.rsi_period)
     adx_series = _adx(df_m5, cfg.adx_period)
-
     lower, mid, upper = _bollinger(close, 20, 2.0)
 
     last_close = float(close.iloc[-1])
@@ -268,13 +261,12 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("Engulfing")
         reasons.append("Bearish engulfing present on M5")
 
-    # 4) BB expansion / position
+    # 4) BB expansion
     last_upper = float(upper.iloc[-1]) if not np.isnan(upper.iloc[-1]) else last_close
     last_lower = float(lower.iloc[-1]) if not np.isnan(lower.iloc[-1]) else last_close
     bb_width = max(0.0, last_upper - last_lower)
 
     if bb_width > 0:
-        # simple “expansion” check: width increasing vs 5 bars ago
         if len(upper) > 6:
             prev_upper = float(upper.iloc[-6]) if not np.isnan(upper.iloc[-6]) else last_upper
             prev_lower = float(lower.iloc[-6]) if not np.isnan(lower.iloc[-6]) else last_lower
@@ -286,7 +278,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
             confirmations.append("BB Expansion")
             reasons.append("Bollinger width expanding (volatility pickup)")
 
-    # 5) Momentum (last close vs previous close)
+    # 5) Momentum
     if len(close) >= 2:
         prev_close = float(close.iloc[-2])
         if direction == "BUY" and last_close > prev_close:
