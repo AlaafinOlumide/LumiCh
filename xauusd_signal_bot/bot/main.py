@@ -3,7 +3,6 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
-from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -12,14 +11,14 @@ from .data import TwelveDataClient, TwelveDataQuotaError
 from .high_impact_news import check_high_impact_news
 from .sessions import now_in_sessions_utc, parse_sessions, session_label
 from .strategy import (
-    detect_trend,
-    m15_confirms,
-    risk_tag_from_context,
-    score_entry_m5,
     Signal,
     atr,
     compute_tp_sl_from_atr,
     confidence_score,
+    detect_trend,
+    m15_confirms,
+    risk_tag_from_context,
+    score_entry_m5,
 )
 from .telegram import TelegramClient
 
@@ -29,6 +28,9 @@ def setup_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+
+cfg_global: Config
 
 
 def fmt_signal(sig: Signal) -> str:
@@ -55,7 +57,9 @@ def fmt_signal(sig: Signal) -> str:
     t = sig.trend_state
     lines.append("*Trend (HTF)*")
     lines.append(f"- TF: `{t.timeframe}` | Dir: *{t.direction}* | Close: {t.close:.2f}")
-    lines.append(f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}")
+    lines.append(
+        f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}"
+    )
     lines.append("")
 
     lines.append("*Filters & Confirmations*")
@@ -72,24 +76,33 @@ def fmt_signal(sig: Signal) -> str:
     return "\n".join(lines)
 
 
-cfg_global: Config
-
-
 def _log_dedupe(
     log: logging.Logger,
     key: str,
     message: str,
-    dedupe_state: dict,
+    dedupe_state: dict[str, float],
     every_seconds: int = 300,
 ) -> None:
-    """
-    Rate-limit repeated logs of the same reason.
-    """
     now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
     last_ts = float(dedupe_state.get(key, 0.0))
     if (now_ts - last_ts) >= every_seconds:
         log.info(message)
         dedupe_state[key] = now_ts
+
+
+def _effective_adx_min(strict_min: float, confirmations: int, min_conf: int) -> tuple[float, bool]:
+    """
+    Recommended ADX policy (based on your logs showing ADX ~16–20 a lot):
+      - If confirmations >= min_conf + 1 : allow ADX down to strict-5 (cap at 15)
+      - If confirmations >= min_conf     : allow ADX down to strict-3 (cap at 17)
+      - Else: strict
+    This keeps quality high while allowing trades in normal market conditions.
+    """
+    if confirmations >= (min_conf + 1):
+        return max(15.0, strict_min - 5.0), True
+    if confirmations >= min_conf:
+        return max(17.0, strict_min - 3.0), True
+    return strict_min, False
 
 
 def main() -> None:
@@ -112,14 +125,13 @@ def main() -> None:
 
     last_signal_time: dt.datetime | None = None
     last_direction: str | None = None
-
     dedupe_state: dict[str, float] = {}
 
-    # Recommended: cap confirmations at 4 so the bot can actually trade.
-    # If your env/config says 5, we still use 4 as the effective requirement.
-    effective_min_confirmations = min(int(getattr(cfg, "min_confirmations", 4)), 4)
+    # Recommended: cap confirmations at 4 so you actually get signals consistently
+    configured_min_conf = int(getattr(cfg, "min_confirmations", 4))
+    effective_min_confirmations = min(configured_min_conf, 4)
 
-    # ATR risk settings (safe defaults)
+    # ATR execution defaults (override via env if you add them later)
     atr_period = int(getattr(cfg, "atr_period", 14))
     sl_atr_mult = float(getattr(cfg, "sl_atr_mult", 1.2))
     tp_atr_mult = float(getattr(cfg, "tp_atr_mult", 2.0))
@@ -128,11 +140,11 @@ def main() -> None:
         "Bot started. Sessions=%s | Symbol=%s | min_confirmations=%s (effective=%s)",
         cfg.trading_sessions,
         cfg.symbol,
-        getattr(cfg, "min_confirmations", None),
+        configured_min_conf,
         effective_min_confirmations,
     )
 
-    EPS = 1e-6  # float tolerance for comparisons (fixes 20.0 < 20.0 printing issue)
+    EPS = 1e-6  # float tolerance
 
     while True:
         try:
@@ -151,7 +163,7 @@ def main() -> None:
 
             s_label = session_label(sessions, now)
 
-            # News check (soft-fail + cached inside)
+            # News check (soft-fail + cached)
             news = check_high_impact_news(
                 provider=cfg.news_api_provider or "fmp",
                 api_key=cfg.news_api_key or "",
@@ -173,7 +185,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # Fetch candles (cached in client)
+            # Fetch candles (cached)
             try:
                 trend_tf = "1h"
                 trend_df = td.fetch_time_series_cached(cfg.symbol, "1h", outputsize=200, ttl_seconds=3600, now_utc=now).df
@@ -224,7 +236,7 @@ def main() -> None:
 
             direction = "BUY" if trend.direction == "BULL" else "SELL"
 
-            # Cooldown logic
+            # Cooldown
             if last_signal_time is not None:
                 mins_since = (now - last_signal_time).total_seconds() / 60
                 if mins_since < cfg.cooldown_minutes and last_direction == direction:
@@ -238,13 +250,23 @@ def main() -> None:
                     time.sleep(cfg.poll_seconds)
                     continue
 
-            confirmations, adx_val, adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
+            confirmations, adx_val, _adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
 
-            # ADX effective min + epsilon tolerance fix
+            # Confirmations gate first (so ADX relaxation can apply correctly)
+            if len(confirmations) < effective_min_confirmations:
+                _log_dedupe(
+                    log,
+                    key="not_enough_confirm",
+                    message=f"Not enough confirmations: {len(confirmations)} (need {effective_min_confirmations})",
+                    dedupe_state=dedupe_state,
+                    every_seconds=180,
+                )
+                time.sleep(cfg.poll_seconds)
+                continue
+
+            # Improved ADX gate (recommended)
             strict_min = float(cfg.adx_min)
-            strong_conf = len(confirmations) >= (effective_min_confirmations + 1)
-            relaxed_min = max(10.0, strict_min - 3.0)  # 20 -> 17 if very strong confirmations
-            effective_adx_min = relaxed_min if strong_conf else strict_min
+            effective_adx_min, relaxed = _effective_adx_min(strict_min, len(confirmations), effective_min_confirmations)
 
             if adx_val + EPS < effective_adx_min:
                 _log_dedupe(
@@ -252,20 +274,8 @@ def main() -> None:
                     key="adx_failed",
                     message=(
                         f"ADX filter failed: {adx_val:.4f} < {effective_adx_min:.4f} "
-                        f"(strict={strict_min:.4f}, strong_conf={strong_conf})"
+                        f"(strict={strict_min:.4f}, relaxed={relaxed}, conf={len(confirmations)}/{effective_min_confirmations})"
                     ),
-                    dedupe_state=dedupe_state,
-                    every_seconds=180,
-                )
-                time.sleep(cfg.poll_seconds)
-                continue
-
-            # Confirmations gate (recommended cap=4)
-            if len(confirmations) < effective_min_confirmations:
-                _log_dedupe(
-                    log,
-                    key="not_enough_confirm",
-                    message=f"Not enough confirmations: {len(confirmations)} (need {effective_min_confirmations})",
                     dedupe_state=dedupe_state,
                     every_seconds=180,
                 )
@@ -284,13 +294,13 @@ def main() -> None:
             news_status = ("⚠️ " + news.message) if news.is_high_impact else "Normal"
             news_is_normal = not news.is_high_impact
 
-            # ENTRY = latest M5 close
+            # ENTRY
             try:
                 entry_price = float(df_m5["close"].iloc[-1])
             except Exception:
                 entry_price = float(trend.close)
 
-            # TP/SL from ATR (use M15 ATR for stability)
+            # TP/SL from ATR (M15 ATR)
             atr_val = atr(df_m15, period=atr_period)
             tp, sl, rr = compute_tp_sl_from_atr(
                 entry=entry_price,
@@ -336,12 +346,13 @@ def main() -> None:
             last_signal_time = now
             last_direction = direction
             log.info(
-                "Signal sent: %s %s | entry=%.2f tp=%.2f sl=%.2f conf=%s%%",
+                "Signal sent: %s %s | entry=%.2f tp=%.2f sl=%.2f rr=%.2f conf=%s%%",
                 direction,
                 cfg.symbol,
                 entry_price,
                 tp,
                 sl,
+                rr,
                 conf,
             )
 
@@ -356,7 +367,6 @@ def main() -> None:
                 log.error("API credits exhausted (generic). Sleeping 3600s.")
                 time.sleep(3600)
                 continue
-
             log.exception("Loop error: %s", e)
 
         time.sleep(cfg.poll_seconds)
