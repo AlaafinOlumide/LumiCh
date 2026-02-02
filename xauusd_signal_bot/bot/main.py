@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -11,14 +12,14 @@ from .data import TwelveDataClient, TwelveDataQuotaError
 from .high_impact_news import check_high_impact_news
 from .sessions import now_in_sessions_utc, parse_sessions, session_label
 from .strategy import (
-    Signal,
-    atr,
-    compute_tp_sl_from_atr,
-    confidence_score,
     detect_trend,
     m15_confirms,
     risk_tag_from_context,
     score_entry_m5,
+    Signal,
+    atr,
+    compute_tp_sl_from_atr,
+    confidence_score,
 )
 from .telegram import TelegramClient
 
@@ -30,38 +31,13 @@ def setup_logging() -> None:
     )
 
 
-cfg_global: Config
-
-
 def fmt_signal(sig: Signal) -> str:
-    """
-    Telegram template (matches your requested format):
-
-    Xauusd: BUY/SELL
-    ENTRY PRICE
-    TP
-    SL
-    Confidence
-
-    2026-01-28 09:15 UTC | Session: *London*
-    Signal: *BUY* | Risk: *MEDIUM*
-    Mode: `H1→M15→M5`
-
-    *Trend (HTF)*
-    ...
-    """
     ts = sig.timestamp_utc.strftime("%Y-%m-%d %H:%M")
 
     entry_txt = f"{sig.entry_price:.2f}" if sig.entry_price is not None else "TBD"
     tp_txt = f"{sig.tp:.2f}" if sig.tp is not None else "TBD"
     sl_txt = f"{sig.sl:.2f}" if sig.sl is not None else "TBD"
-
-    # Confidence line: show score + emoji if available, else fallback label
-    if sig.confidence is not None:
-        emoji = sig.confidence_emoji or ""
-        conf_txt = f"{sig.confidence}{emoji}"
-    else:
-        conf_txt = "MEDIUM"
+    conf_txt = f"{sig.confidence}% {sig.confidence_emoji}" if sig.confidence is not None else "TBD"
 
     lines: list[str] = []
     lines.append(f"Xauusd: {sig.direction}")
@@ -79,9 +55,7 @@ def fmt_signal(sig: Signal) -> str:
     t = sig.trend_state
     lines.append("*Trend (HTF)*")
     lines.append(f"- TF: `{t.timeframe}` | Dir: *{t.direction}* | Close: {t.close:.2f}")
-    lines.append(
-        f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}"
-    )
+    lines.append(f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}")
     lines.append("")
 
     lines.append("*Filters & Confirmations*")
@@ -98,12 +72,21 @@ def fmt_signal(sig: Signal) -> str:
     return "\n".join(lines)
 
 
-def _log_dedupe(log: logging.Logger, key: str, message: str, dedupe_state: dict[str, float], every_seconds: int = 300) -> None:
+cfg_global: Config
+
+
+def _log_dedupe(
+    log: logging.Logger,
+    key: str,
+    message: str,
+    dedupe_state: dict,
+    every_seconds: int = 300,
+) -> None:
     """
     Rate-limit repeated logs of the same reason.
     """
     now_ts = dt.datetime.now(dt.timezone.utc).timestamp()
-    last_ts = dedupe_state.get(key, 0.0)
+    last_ts = float(dedupe_state.get(key, 0.0))
     if (now_ts - last_ts) >= every_seconds:
         log.info(message)
         dedupe_state[key] = now_ts
@@ -132,13 +115,29 @@ def main() -> None:
 
     dedupe_state: dict[str, float] = {}
 
-    log.info("Bot started. Sessions=%s | Symbol=%s", cfg.trading_sessions, cfg.symbol)
+    # Recommended: cap confirmations at 4 so the bot can actually trade.
+    # If your env/config says 5, we still use 4 as the effective requirement.
+    effective_min_confirmations = min(int(getattr(cfg, "min_confirmations", 4)), 4)
+
+    # ATR risk settings (safe defaults)
+    atr_period = int(getattr(cfg, "atr_period", 14))
+    sl_atr_mult = float(getattr(cfg, "sl_atr_mult", 1.2))
+    tp_atr_mult = float(getattr(cfg, "tp_atr_mult", 2.0))
+
+    log.info(
+        "Bot started. Sessions=%s | Symbol=%s | min_confirmations=%s (effective=%s)",
+        cfg.trading_sessions,
+        cfg.symbol,
+        getattr(cfg, "min_confirmations", None),
+        effective_min_confirmations,
+    )
+
+    EPS = 1e-6  # float tolerance for comparisons (fixes 20.0 < 20.0 printing issue)
 
     while True:
         try:
             now = dt.datetime.now(dt.timezone.utc)
 
-            # --- Session gate ---
             if not now_in_sessions_utc(sessions, now):
                 _log_dedupe(
                     log,
@@ -152,7 +151,7 @@ def main() -> None:
 
             s_label = session_label(sessions, now)
 
-            # --- News check (soft fail handled inside high_impact_news) ---
+            # News check (soft-fail + cached inside)
             news = check_high_impact_news(
                 provider=cfg.news_api_provider or "fmp",
                 api_key=cfg.news_api_key or "",
@@ -174,7 +173,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # --- Fetch candles (cached in client to reduce credits) ---
+            # Fetch candles (cached in client)
             try:
                 trend_tf = "1h"
                 trend_df = td.fetch_time_series_cached(cfg.symbol, "1h", outputsize=200, ttl_seconds=3600, now_utc=now).df
@@ -199,7 +198,6 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # --- Trend ---
             trend = detect_trend(trend_df, trend_tf, cfg.ema_fast, cfg.ema_slow, cfg.ema_slope_bars)
             if trend.direction == "NEUTRAL":
                 _log_dedupe(
@@ -212,7 +210,6 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # --- M15 confirm ---
             ok_confirm, confirm_reason = m15_confirms(df_m15, trend.direction, cfg.ema_fast, cfg.rsi_period)
             if not ok_confirm:
                 _log_dedupe(
@@ -227,7 +224,7 @@ def main() -> None:
 
             direction = "BUY" if trend.direction == "BULL" else "SELL"
 
-            # --- Cooldown ---
+            # Cooldown logic
             if last_signal_time is not None:
                 mins_since = (now - last_signal_time).total_seconds() / 60
                 if mins_since < cfg.cooldown_minutes and last_direction == direction:
@@ -241,40 +238,44 @@ def main() -> None:
                     time.sleep(cfg.poll_seconds)
                     continue
 
-            # --- Entry scoring ---
-            confirmations, adx_val, _adx_pass_strict, reason_bullets = score_entry_m5(df_m5, direction, cfg)
+            confirmations, adx_val, adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
 
-            # Smarter ADX gate: if confirmations are strong, allow slightly lower ADX.
+            # ADX effective min + epsilon tolerance fix
             strict_min = float(cfg.adx_min)
-            relaxed_min = max(10.0, strict_min - 3.0)  # e.g., 20 -> 17
-            strong_conf = len(confirmations) >= (cfg.min_confirmations + 1)
-            effective_min = relaxed_min if strong_conf else strict_min
+            strong_conf = len(confirmations) >= (effective_min_confirmations + 1)
+            relaxed_min = max(10.0, strict_min - 3.0)  # 20 -> 17 if very strong confirmations
+            effective_adx_min = relaxed_min if strong_conf else strict_min
 
-            if adx_val < effective_min:
+            if adx_val + EPS < effective_adx_min:
                 _log_dedupe(
                     log,
                     key="adx_failed",
-                    message=f"ADX filter failed: {adx_val:.1f} < {effective_min:.1f} (strict={strict_min:.1f}, strong_conf={strong_conf})",
+                    message=(
+                        f"ADX filter failed: {adx_val:.4f} < {effective_adx_min:.4f} "
+                        f"(strict={strict_min:.4f}, strong_conf={strong_conf})"
+                    ),
                     dedupe_state=dedupe_state,
                     every_seconds=180,
                 )
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            if len(confirmations) < cfg.min_confirmations:
+            # Confirmations gate (recommended cap=4)
+            if len(confirmations) < effective_min_confirmations:
                 _log_dedupe(
                     log,
                     key="not_enough_confirm",
-                    message=f"Not enough confirmations: {len(confirmations)} (need {cfg.min_confirmations})",
+                    message=f"Not enough confirmations: {len(confirmations)} (need {effective_min_confirmations})",
                     dedupe_state=dedupe_state,
                     every_seconds=180,
                 )
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # --- Reasons ---
             reasons: list[str] = []
-            reasons.append(f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})")
+            reasons.append(
+                f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})"
+            )
             reasons.append(confirm_reason)
             reasons.extend(reason_bullets)
 
@@ -283,26 +284,27 @@ def main() -> None:
             news_status = ("⚠️ " + news.message) if news.is_high_impact else "Normal"
             news_is_normal = not news.is_high_impact
 
-            # --- Entry = latest M5 close ---
+            # ENTRY = latest M5 close
             try:
                 entry_price = float(df_m5["close"].iloc[-1])
             except Exception:
                 entry_price = float(trend.close)
 
-            # --- TP/SL via ATR ---
-            atr_period = int(getattr(cfg, "atr_period", 14))
-            sl_mult = float(getattr(cfg, "atr_sl_mult", 1.5))
-            tp_mult = float(getattr(cfg, "atr_tp_mult", 3.0))
+            # TP/SL from ATR (use M15 ATR for stability)
+            atr_val = atr(df_m15, period=atr_period)
+            tp, sl, rr = compute_tp_sl_from_atr(
+                entry=entry_price,
+                direction=direction,
+                atr_value=atr_val,
+                sl_mult=sl_atr_mult,
+                tp_mult=tp_atr_mult,
+            )
 
-            atr_val = atr(df_m5, atr_period)
-            tp, sl, rr = compute_tp_sl_from_atr(entry_price, direction, atr_val, sl_mult, tp_mult)
-
-            # --- Confidence score (0-100 + emoji) ---
             conf, conf_emoji = confidence_score(
                 confirmations_passed=len(confirmations),
-                confirmations_required=cfg.min_confirmations,
+                confirmations_required=effective_min_confirmations,
                 adx_value=adx_val,
-                adx_min=effective_min,
+                adx_min=effective_adx_min,
                 news_is_normal=news_is_normal,
             )
 
@@ -316,9 +318,9 @@ def main() -> None:
                 trend_state=trend,
                 confirmations=confirmations,
                 confirmations_passed=len(confirmations),
-                confirmations_required=cfg.min_confirmations,
+                confirmations_required=effective_min_confirmations,
                 adx_value=adx_val,
-                adx_min=effective_min,
+                adx_min=effective_adx_min,
                 news_status=news_status,
                 reason_bullets=reasons,
                 entry_price=entry_price,
@@ -333,31 +335,29 @@ def main() -> None:
 
             last_signal_time = now
             last_direction = direction
-
             log.info(
-                "Signal sent: %s %s | entry=%.2f tp=%.2f sl=%.2f rr=%.2f conf=%s%s",
+                "Signal sent: %s %s | entry=%.2f tp=%.2f sl=%.2f conf=%s%%",
                 direction,
                 cfg.symbol,
                 entry_price,
                 tp,
                 sl,
-                rr,
                 conf,
-                conf_emoji or "",
             )
 
         except TwelveDataQuotaError:
-            logging.getLogger("xauusd_bot").error("TwelveData daily credits exhausted. Sleeping 3600s.")
+            log.error("TwelveData daily credits exhausted. Sleeping 3600s.")
             time.sleep(3600)
             continue
 
         except Exception as e:
             msg = str(e).lower()
             if "run out of api credits" in msg or "out of api credits" in msg:
-                logging.getLogger("xauusd_bot").error("API credits exhausted (generic). Sleeping 3600s.")
+                log.error("API credits exhausted (generic). Sleeping 3600s.")
                 time.sleep(3600)
                 continue
-            logging.getLogger("xauusd_bot").exception("Loop error: %s", e)
+
+            log.exception("Loop error: %s", e)
 
         time.sleep(cfg.poll_seconds)
 
