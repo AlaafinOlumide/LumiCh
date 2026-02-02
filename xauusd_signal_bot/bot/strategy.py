@@ -6,9 +6,6 @@ import pandas as pd
 import numpy as np
 
 
-# =========================
-# Data models
-# =========================
 @dataclass(frozen=True)
 class TrendState:
     timeframe: str
@@ -39,7 +36,6 @@ class Signal:
     news_status: str
     reason_bullets: list[str]
 
-    # Execution fields
     entry_price: float | None = None
     tp: float | None = None
     sl: float | None = None
@@ -48,9 +44,6 @@ class Signal:
     confidence_emoji: str | None = None
 
 
-# =========================
-# Indicator helpers
-# =========================
 def _ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
@@ -87,10 +80,6 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Lightweight ADX (Wilder-like). Enough for filtering.
-    Requires: high, low, close
-    """
     high = df["high"].astype(float)
     low = df["low"].astype(float)
 
@@ -134,9 +123,6 @@ def _is_bearish_engulfing(df: pd.DataFrame) -> bool:
     return (c1 > o1) and (c2 < o2) and (o2 >= c1) and (c2 <= o1)
 
 
-# =========================
-# Public API required by main.py
-# =========================
 def detect_trend(
     df: pd.DataFrame,
     timeframe: str,
@@ -217,7 +203,6 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     ema_fast = _ema(close, cfg.ema_fast)
     rsi = _rsi(close, cfg.rsi_period)
     adx_series = _adx(df_m5, cfg.adx_period)
-
     lower, mid, upper = _bollinger(close, 20, 2.0)
 
     last_close = float(close.iloc[-1])
@@ -228,7 +213,6 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     confirmations: list[str] = []
     reasons: list[str] = []
 
-    # 1) RSI
     if direction == "BUY" and last_rsi >= 50:
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≥ 50)")
@@ -236,7 +220,6 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≤ 50)")
 
-    # 2) EMA location
     if direction == "BUY" and last_close >= last_ema:
         confirmations.append("EMA Pullback")
         reasons.append(f"Price above EMA{cfg.ema_fast} (continuation bias)")
@@ -244,7 +227,6 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("EMA Pullback")
         reasons.append(f"Price below EMA{cfg.ema_fast} (continuation bias)")
 
-    # 3) Engulfing
     if direction == "BUY" and _is_bullish_engulfing(df_m5):
         confirmations.append("Engulfing")
         reasons.append("Bullish engulfing present on M5")
@@ -252,7 +234,6 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("Engulfing")
         reasons.append("Bearish engulfing present on M5")
 
-    # 4) BB expansion
     last_upper = float(upper.iloc[-1]) if not np.isnan(upper.iloc[-1]) else last_close
     last_lower = float(lower.iloc[-1]) if not np.isnan(lower.iloc[-1]) else last_close
     bb_width = max(0.0, last_upper - last_lower)
@@ -269,7 +250,6 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
             confirmations.append("BB Expansion")
             reasons.append("Bollinger width expanding (volatility pickup)")
 
-    # 5) Momentum
     if len(close) >= 2:
         prev_close = float(close.iloc[-2])
         if direction == "BUY" and last_close > prev_close:
@@ -283,9 +263,6 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     return confirmations, adx_val, adx_pass, reasons
 
 
-# =========================
-# ATR + Execution helpers
-# =========================
 def atr(df: pd.DataFrame, period: int = 14) -> float:
     s = _atr(df, period)
     v = float(s.iloc[-1])
@@ -335,7 +312,6 @@ def confidence_score(
         adx_bonus = 15.0
 
     news_adj = 10.0 if news_is_normal else -10.0
-
     score = int(max(0, min(100, base + adx_bonus + news_adj)))
 
     if score >= 75:
