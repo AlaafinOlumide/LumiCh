@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Tuple
-
-import numpy as np
 import pandas as pd
+import numpy as np
 
 
 # =========================
@@ -153,7 +152,6 @@ def detect_trend(
     last_ef = float(ef.iloc[-1])
     last_es = float(es.iloc[-1])
 
-    # slope based on fast EMA change
     if len(ef) > ema_slope_bars + 1:
         prev = float(ef.iloc[-(ema_slope_bars + 1)])
         diff = last_ef - prev
@@ -207,7 +205,6 @@ def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period
 
 
 def risk_tag_from_context(trend_tf: str) -> str:
-    # simple: H1 trend = medium, fallback = medium, lower TF only = high
     if trend_tf == "1h":
         return "MEDIUM"
     if trend_tf == "15min":
@@ -216,17 +213,11 @@ def risk_tag_from_context(trend_tf: str) -> str:
 
 
 def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str], float, bool, list[str]]:
-    """
-    Returns:
-      confirmations(list[str]),
-      adx_value(float),
-      adx_pass(bool)  -> STRICT pass against cfg.adx_min
-      reason_bullets(list[str])
-    """
     close = df_m5["close"].astype(float)
     ema_fast = _ema(close, cfg.ema_fast)
     rsi = _rsi(close, cfg.rsi_period)
     adx_series = _adx(df_m5, cfg.adx_period)
+
     lower, mid, upper = _bollinger(close, 20, 2.0)
 
     last_close = float(close.iloc[-1])
@@ -237,7 +228,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     confirmations: list[str] = []
     reasons: list[str] = []
 
-    # 1) RSI confirmation
+    # 1) RSI
     if direction == "BUY" and last_rsi >= 50:
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≥ 50)")
@@ -245,7 +236,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≤ 50)")
 
-    # 2) EMA pullback / location
+    # 2) EMA location
     if direction == "BUY" and last_close >= last_ema:
         confirmations.append("EMA Pullback")
         reasons.append(f"Price above EMA{cfg.ema_fast} (continuation bias)")
@@ -253,7 +244,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("EMA Pullback")
         reasons.append(f"Price below EMA{cfg.ema_fast} (continuation bias)")
 
-    # 3) Engulfing candle
+    # 3) Engulfing
     if direction == "BUY" and _is_bullish_engulfing(df_m5):
         confirmations.append("Engulfing")
         reasons.append("Bullish engulfing present on M5")
@@ -293,7 +284,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
 
 
 # =========================
-# ATR + Execution helpers (used by main.py)
+# ATR + Execution helpers
 # =========================
 def atr(df: pd.DataFrame, period: int = 14) -> float:
     s = _atr(df, period)
