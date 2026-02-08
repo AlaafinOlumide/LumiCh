@@ -37,14 +37,16 @@ def fmt_signal(sig: Signal) -> str:
     ts = sig.timestamp_utc.strftime("%Y-%m-%d %H:%M")
 
     entry_txt = f"{sig.entry_price:.2f}" if sig.entry_price is not None else "TBD"
-    tp_txt = f"{sig.tp:.2f}" if sig.tp is not None else "TBD"
+    tp1_txt = f"{sig.tp1:.2f}" if sig.tp1 is not None else "TBD"
+    tp2_txt = f"{sig.tp2:.2f}" if sig.tp2 is not None else "TBD"
     sl_txt = f"{sig.sl:.2f}" if sig.sl is not None else "TBD"
     conf_txt = f"{sig.confidence}% {sig.confidence_emoji}" if sig.confidence is not None else "TBD"
 
     lines: list[str] = []
     lines.append(f"Xauusd: {sig.direction}")
     lines.append(f"ENTRY PRICE: {entry_txt}")
-    lines.append(f"TP: {tp_txt}")
+    lines.append(f"TP1: {tp1_txt}")
+    lines.append(f"TP2: {tp2_txt}  (TP2 may not be reached — take profit when convenient)")
     lines.append(f"SL: {sl_txt}")
     lines.append(f"Confidence: {conf_txt}")
     lines.append("")
@@ -91,18 +93,16 @@ def _log_dedupe(
 
 
 def _effective_adx_min(strict_min: float, confirmations: int, min_conf: int) -> tuple[float, bool]:
-    """
-    Recommended ADX policy (based on your logs showing ADX ~16–20 a lot):
-      - If confirmations >= min_conf + 1 : allow ADX down to strict-5 (cap at 15)
-      - If confirmations >= min_conf     : allow ADX down to strict-3 (cap at 17)
-      - Else: strict
-    This keeps quality high while allowing trades in normal market conditions.
-    """
     if confirmations >= (min_conf + 1):
         return max(15.0, strict_min - 5.0), True
     if confirmations >= min_conf:
         return max(17.0, strict_min - 3.0), True
     return strict_min, False
+
+
+def _is_weekend_utc(now: dt.datetime) -> bool:
+    # Monday=0 ... Sunday=6
+    return now.weekday() >= 5  # 5=Sat, 6=Sun
 
 
 def main() -> None:
@@ -127,28 +127,38 @@ def main() -> None:
     last_direction: str | None = None
     dedupe_state: dict[str, float] = {}
 
-    # Recommended: cap confirmations at 4 so you actually get signals consistently
     configured_min_conf = int(getattr(cfg, "min_confirmations", 4))
     effective_min_confirmations = min(configured_min_conf, 4)
 
-    # ATR execution defaults (override via env if you add them later)
     atr_period = int(getattr(cfg, "atr_period", 14))
     sl_atr_mult = float(getattr(cfg, "sl_atr_mult", 1.2))
     tp_atr_mult = float(getattr(cfg, "tp_atr_mult", 2.0))
 
     log.info(
-        "Bot started. Sessions=%s | Symbol=%s | min_confirmations=%s (effective=%s)",
+        "Bot started. Sessions=%s | Symbol=%s | min_confirmations=%s (effective=%s) | weekends_blocked=True",
         cfg.trading_sessions,
         cfg.symbol,
         configured_min_conf,
         effective_min_confirmations,
     )
 
-    EPS = 1e-6  # float tolerance
+    EPS = 1e-6
 
     while True:
         try:
             now = dt.datetime.now(dt.timezone.utc)
+
+            # ---- Weekend Block ----
+            if _is_weekend_utc(now):
+                _log_dedupe(
+                    log,
+                    key="weekend_block",
+                    message=f"Weekend (UTC) detected. Bot paused. Sleeping {cfg.poll_seconds}s...",
+                    dedupe_state=dedupe_state,
+                    every_seconds=900,
+                )
+                time.sleep(cfg.poll_seconds)
+                continue
 
             if not now_in_sessions_utc(sessions, now):
                 _log_dedupe(
@@ -163,7 +173,6 @@ def main() -> None:
 
             s_label = session_label(sessions, now)
 
-            # News check (soft-fail + cached)
             news = check_high_impact_news(
                 provider=cfg.news_api_provider or "fmp",
                 api_key=cfg.news_api_key or "",
@@ -236,7 +245,6 @@ def main() -> None:
 
             direction = "BUY" if trend.direction == "BULL" else "SELL"
 
-            # Cooldown
             if last_signal_time is not None:
                 mins_since = (now - last_signal_time).total_seconds() / 60
                 if mins_since < cfg.cooldown_minutes and last_direction == direction:
@@ -252,7 +260,6 @@ def main() -> None:
 
             confirmations, adx_val, _adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
 
-            # Confirmations gate first (so ADX relaxation can apply correctly)
             if len(confirmations) < effective_min_confirmations:
                 _log_dedupe(
                     log,
@@ -264,7 +271,6 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # Improved ADX gate (recommended)
             strict_min = float(cfg.adx_min)
             effective_adx_min, relaxed = _effective_adx_min(strict_min, len(confirmations), effective_min_confirmations)
 
@@ -300,15 +306,21 @@ def main() -> None:
             except Exception:
                 entry_price = float(trend.close)
 
-            # TP/SL from ATR (M15 ATR)
+            # Compute original TP (this will become TP2) + SL from ATR
             atr_val = atr(df_m15, period=atr_period)
-            tp, sl, rr = compute_tp_sl_from_atr(
+            tp2, sl, rr = compute_tp_sl_from_atr(
                 entry=entry_price,
                 direction=direction,
                 atr_value=atr_val,
                 sl_mult=sl_atr_mult,
                 tp_mult=tp_atr_mult,
             )
+
+            # TP1 = half the distance to TP2
+            if direction == "BUY":
+                tp1 = entry_price + ((tp2 - entry_price) * 0.5)
+            else:
+                tp1 = entry_price - ((entry_price - tp2) * 0.5)
 
             conf, conf_emoji = confidence_score(
                 confirmations_passed=len(confirmations),
@@ -334,7 +346,8 @@ def main() -> None:
                 news_status=news_status,
                 reason_bullets=reasons,
                 entry_price=entry_price,
-                tp=tp,
+                tp1=tp1,
+                tp2=tp2,
                 sl=sl,
                 rr=rr,
                 confidence=conf,
@@ -346,11 +359,12 @@ def main() -> None:
             last_signal_time = now
             last_direction = direction
             log.info(
-                "Signal sent: %s %s | entry=%.2f tp=%.2f sl=%.2f rr=%.2f conf=%s%%",
+                "Signal sent: %s %s | entry=%.2f tp1=%.2f tp2=%.2f sl=%.2f rr=%.2f conf=%s%%",
                 direction,
                 cfg.symbol,
                 entry_price,
-                tp,
+                tp1,
+                tp2,
                 sl,
                 rr,
                 conf,
