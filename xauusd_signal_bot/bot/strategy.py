@@ -36,8 +36,10 @@ class Signal:
     news_status: str
     reason_bullets: list[str]
 
+    # Execution fields
     entry_price: float | None = None
-    tp: float | None = None
+    tp1: float | None = None
+    tp2: float | None = None
     sl: float | None = None
     rr: float | None = None
     confidence: int | None = None
