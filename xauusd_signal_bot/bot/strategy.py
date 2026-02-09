@@ -6,40 +6,32 @@ import pandas as pd
 import numpy as np
 
 
-# =========================
-# Data models
-# =========================
 @dataclass(frozen=True)
 class TrendState:
     timeframe: str
-    direction: str  # "BULL", "BEAR", "NEUTRAL"
+    direction: str
     close: float
     ema_fast: float
     ema_slow: float
-    slope: str  # "UP", "DOWN", "FLAT"
+    slope: str
 
 
 @dataclass(frozen=True)
 class Signal:
     symbol: str
     timestamp_utc: object
-    direction: str  # "BUY"/"SELL"
+    direction: str
     risk_tag: str
     timeframe_mode: str
     session_label: str
-
     trend_state: TrendState
-
     confirmations: list[str]
     confirmations_passed: int
     confirmations_required: int
-
     adx_value: float
     adx_min: float
     news_status: str
     reason_bullets: list[str]
-
-    # Execution fields (optional)
     entry_price: float | None = None
     tp: float | None = None
     sl: float | None = None
@@ -48,9 +40,6 @@ class Signal:
     confidence_emoji: str | None = None
 
 
-# =========================
-# Indicator helpers
-# =========================
 def _ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
@@ -59,10 +48,8 @@ def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     up = delta.clip(lower=0.0)
     down = (-delta).clip(lower=0.0)
-
     avg_gain = up.ewm(alpha=1 / period, adjust=False).mean()
     avg_loss = down.ewm(alpha=1 / period, adjust=False).mean()
-
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50.0)
@@ -73,44 +60,25 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     low = df["low"].astype(float)
     close = df["close"].astype(float)
     prev_close = close.shift(1)
-
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
+    tr = pd.concat([(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
 
 def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Lightweight ADX (Wilder-like). Enough for filtering.
-    Requires: high, low, close
-    """
     high = df["high"].astype(float)
     low = df["low"].astype(float)
-
     up_move = high.diff()
     down_move = -low.diff()
-
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
     atr_s = _atr(df, period).replace(0, np.nan)
-
     plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_s)
     minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_s)
-
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
-    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
-    return adx.fillna(0.0)
+    return dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0.0)
 
 
-def _bollinger(close: pd.Series, period: int = 20, std_mult: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
+def _bollinger(close: pd.Series, period: int = 20, std_mult: float = 2.0):
     mid = close.rolling(period).mean()
     std = close.rolling(period).std()
     upper = mid + std_mult * std
@@ -134,20 +102,10 @@ def _is_bearish_engulfing(df: pd.DataFrame) -> bool:
     return (c1 > o1) and (c2 < o2) and (o2 >= c1) and (c2 <= o1)
 
 
-# =========================
-# Public API required by main.py
-# =========================
-def detect_trend(
-    df: pd.DataFrame,
-    timeframe: str,
-    ema_fast: int,
-    ema_slow: int,
-    ema_slope_bars: int,
-) -> TrendState:
+def detect_trend(df: pd.DataFrame, timeframe: str, ema_fast: int, ema_slow: int, ema_slope_bars: int) -> TrendState:
     close = df["close"].astype(float)
     ef = _ema(close, ema_fast)
     es = _ema(close, ema_slow)
-
     last_close = float(close.iloc[-1])
     last_ef = float(ef.iloc[-1])
     last_es = float(es.iloc[-1])
@@ -158,12 +116,7 @@ def detect_trend(
     else:
         diff = 0.0
 
-    if diff > 0:
-        slope = "UP"
-    elif diff < 0:
-        slope = "DOWN"
-    else:
-        slope = "FLAT"
+    slope = "UP" if diff > 0 else ("DOWN" if diff < 0 else "FLAT")
 
     if last_ef > last_es and slope == "UP":
         direction = "BULL"
@@ -172,21 +125,13 @@ def detect_trend(
     else:
         direction = "NEUTRAL"
 
-    return TrendState(
-        timeframe=timeframe,
-        direction=direction,
-        close=last_close,
-        ema_fast=last_ef,
-        ema_slow=last_es,
-        slope=slope,
-    )
+    return TrendState(timeframe=timeframe, direction=direction, close=last_close, ema_fast=last_ef, ema_slow=last_es, slope=slope)
 
 
 def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period: int) -> Tuple[bool, str]:
     close = df_m15["close"].astype(float)
     ema = _ema(close, ema_fast)
     rsi = _rsi(close, rsi_period)
-
     last_close = float(close.iloc[-1])
     last_ema = float(ema.iloc[-1])
     last_rsi = float(rsi.iloc[-1])
@@ -195,21 +140,15 @@ def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period
         if last_close >= last_ema and last_rsi >= 45:
             return True, "M15 confirms bullish continuation (price above EMA, RSI supportive)"
         return False, f"M15 weak for BULL (close {last_close:.2f} vs EMA{ema_fast} {last_ema:.2f}, RSI {last_rsi:.1f})"
-
     if trend_dir == "BEAR":
         if last_close <= last_ema and last_rsi <= 55:
             return True, "M15 confirms bearish continuation (price below EMA, RSI supportive)"
         return False, f"M15 weak for BEAR (close {last_close:.2f} vs EMA{ema_fast} {last_ema:.2f}, RSI {last_rsi:.1f})"
-
     return False, "Trend is NEUTRAL"
 
 
 def risk_tag_from_context(trend_tf: str) -> str:
-    if trend_tf == "1h":
-        return "MEDIUM"
-    if trend_tf == "15min":
-        return "MEDIUM"
-    return "HIGH"
+    return "MEDIUM" if trend_tf in ("1h", "15min") else "HIGH"
 
 
 def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str], float, bool, list[str]]:
@@ -217,7 +156,6 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     ema_fast = _ema(close, cfg.ema_fast)
     rsi = _rsi(close, cfg.rsi_period)
     adx_series = _adx(df_m5, cfg.adx_period)
-
     lower, mid, upper = _bollinger(close, 20, 2.0)
 
     last_close = float(close.iloc[-1])
@@ -254,13 +192,11 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     bb_width = max(0.0, last_upper - last_lower)
 
     if bb_width > 0:
+        prev_width = bb_width
         if len(upper) > 6:
             prev_upper = float(upper.iloc[-6]) if not np.isnan(upper.iloc[-6]) else last_upper
             prev_lower = float(lower.iloc[-6]) if not np.isnan(lower.iloc[-6]) else last_lower
             prev_width = max(0.0, prev_upper - prev_lower)
-        else:
-            prev_width = bb_width
-
         if bb_width >= prev_width:
             confirmations.append("BB Expansion")
             reasons.append("Bollinger width expanding (volatility pickup)")
@@ -278,26 +214,14 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     return confirmations, adx_val, adx_pass, reasons
 
 
-# =========================
-# PUBLIC ATR + Execution helpers (EXPORTED)
-# =========================
+# ---- EXPORTED ----
 def atr(df: pd.DataFrame, period: int = 14) -> float:
-    """Public ATR helper (returns latest ATR value)."""
     s = _atr(df, period)
     v = float(s.iloc[-1])
     return v if v == v else 0.0
 
 
-def compute_tp_sl_from_atr(
-    entry: float,
-    direction: str,
-    atr_value: float,
-    sl_mult: float,
-    tp_mult: float,
-) -> tuple[float, float, float]:
-    """
-    Returns: (tp, sl, rr)
-    """
+def compute_tp_sl_from_atr(entry: float, direction: str, atr_value: float, sl_mult: float, tp_mult: float) -> tuple[float, float, float]:
     if atr_value <= 0:
         atr_value = max(entry * 0.001, 1.0)
 
