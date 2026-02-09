@@ -111,8 +111,7 @@ def _log_dedupe(log: logging.Logger, key: str, message: str, dedupe_state: dict,
 
 
 def _is_weekend_utc(now: dt.datetime) -> bool:
-    # Monday=0 ... Sunday=6
-    return now.weekday() >= 5  # Sat(5), Sun(6)
+    return now.weekday() >= 5  # Sat=5, Sun=6
 
 
 def main() -> None:
@@ -144,7 +143,7 @@ def main() -> None:
         try:
             now = dt.datetime.now(dt.timezone.utc)
 
-            # ---- Block weekends ----
+            # ---- weekend block ----
             if _is_weekend_utc(now):
                 _log_dedupe(
                     log,
@@ -156,7 +155,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # ---- Sessions ----
+            # ---- sessions ----
             if not now_in_sessions_utc(sessions, now):
                 _log_dedupe(
                     log,
@@ -170,7 +169,7 @@ def main() -> None:
 
             s_label = session_label(sessions, now)
 
-            # ---- News check (soft fail) ----
+            # ---- news check (soft-fail) ----
             news = check_high_impact_news(
                 provider=cfg.news_api_provider or "fmp",
                 api_key=cfg.news_api_key or "",
@@ -192,7 +191,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # ---- Fetch candles (cached) ----
+            # ---- fetch candles (cached) ----
             try:
                 trend_tf = "1h"
                 trend_df = td.fetch_time_series_cached(cfg.symbol, "1h", outputsize=200, ttl_seconds=3600, now_utc=now).df
@@ -211,22 +210,13 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # ---- Debug drift (helps you see why entry != broker tick) ----
-            try:
-                m5_last = float(df_m5["close"].iloc[-1])
-                m15_last = float(df_m15["close"].iloc[-1])
-                log.info("Price snapshot: M5=%.2f | M15=%.2f | drift=%.2f", m5_last, m15_last, (m5_last - m15_last))
-            except Exception:
-                pass
-
-            # ---- Trend ----
+            # ---- trend ----
             trend = detect_trend(trend_df, trend_tf, cfg.ema_fast, cfg.ema_slow, cfg.ema_slope_bars)
             if trend.direction == "NEUTRAL":
                 _log_dedupe(log, "trend_neutral", "HTF trend neutral. No signals.", dedupe_state, 300)
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # ---- M15 confirm ----
             ok_confirm, confirm_reason = m15_confirms(df_m15, trend.direction, cfg.ema_fast, cfg.rsi_period)
             if not ok_confirm:
                 _log_dedupe(log, "m15_not_confirm", f"M15 did not confirm. {confirm_reason}", dedupe_state, 180)
@@ -235,7 +225,7 @@ def main() -> None:
 
             direction = "BUY" if trend.direction == "BULL" else "SELL"
 
-            # ---- Cooldown ----
+            # ---- cooldown ----
             if last_signal_time is not None:
                 mins_since = (now - last_signal_time).total_seconds() / 60
                 if mins_since < cfg.cooldown_minutes and last_direction == direction:
@@ -245,15 +235,8 @@ def main() -> None:
 
             confirmations, adx_val, adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
 
-            # Keep your strict ADX (you can relax later if you want more signals)
             if not (adx_val >= float(cfg.adx_min)):
-                _log_dedupe(
-                    log,
-                    "adx_failed",
-                    f"ADX filter failed: {adx_val:.1f} < {float(cfg.adx_min):.1f}",
-                    dedupe_state,
-                    180,
-                )
+                _log_dedupe(log, "adx_failed", f"ADX filter failed: {adx_val:.1f} < {float(cfg.adx_min):.1f}", dedupe_state, 180)
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -268,7 +251,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # ---- Build reasons ----
+            # ---- reasons ----
             reasons: list[str] = []
             reasons.append(f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})")
             reasons.append(confirm_reason)
@@ -278,11 +261,12 @@ def main() -> None:
             risk_tag = risk_tag_from_context(trend_tf)
             news_status = ("⚠️ " + news.message) if news.is_high_impact else "Normal"
 
-            # ---- Entry = latest M5 close ----
+            # ---- entry = latest M5 close ----
             entry_price = float(df_m5["close"].iloc[-1])
 
-            # ---- M15 ATR-based SL/TP2, then TP1 at half distance ----
+            # ---- M15 ATR for SL/TP2 ----
             m15_atr = atr(df_m15, period=cfg.atr_period)
+
             tp2, sl, rr = compute_tp_sl_from_atr(
                 entry=entry_price,
                 direction=direction,
@@ -291,7 +275,7 @@ def main() -> None:
                 tp_mult=cfg.atr_tp_mult,
             )
 
-            # TP1 = half-way to TP2
+            # TP1 = 50% of TP distance
             if direction == "BUY":
                 tp1 = entry_price + (tp2 - entry_price) * 0.5
             else:
@@ -344,7 +328,6 @@ def main() -> None:
                 log.error("API credits exhausted (generic). Sleeping 3600s.")
                 time.sleep(3600)
                 continue
-
             log.exception("Loop error: %s", e)
 
         time.sleep(cfg.poll_seconds)
