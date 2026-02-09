@@ -33,11 +33,9 @@ def setup_logging() -> None:
 def _confidence_from_confirmations(passed: int, required: int, adx_val: float, adx_min: float) -> str:
     if required <= 0:
         return "MEDIUM"
-
     ratio = passed / required
     adx_strong = adx_val >= (adx_min + 10)
     adx_ok = adx_val >= adx_min
-
     if ratio >= 1.0 and adx_strong:
         return "HIGH"
     if ratio >= 1.0 and adx_ok:
@@ -82,13 +80,15 @@ def fmt_signal(
     t = sig.trend_state
     lines.append("*Trend (HTF)*")
     lines.append(f"- TF: `{t.timeframe}` | Dir: *{t.direction}* | Close: {t.close:.2f}")
-    lines.append(f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}")
+    lines.append(
+        f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}"
+    )
     lines.append("")
 
     lines.append("*Filters & Confirmations*")
     joined = ", ".join(sig.confirmations) if sig.confirmations else "None"
     lines.append(f"- Confirmations: *{sig.confirmations_passed}/{sig.confirmations_required}* ({joined})")
-    lines.append(f"- ADX: {sig.adx_value:.1f} (min {sig.adx_min})")
+    lines.append(f"- ADX: {sig.adx_value:.1f} (min {sig.adx_min:.1f})")
     lines.append(f"- News: {sig.news_status}")
     lines.append("")
 
@@ -137,7 +137,16 @@ def main() -> None:
 
     dedupe_state: dict[str, float] = {}
 
-    log.info("Bot started. Sessions=%s | Symbol=%s", cfg.trading_sessions, cfg.symbol)
+    # adaptive confirmations: allow 4/5 (but only when market is trending enough)
+    effective_min_confirmations = max(3, cfg.min_confirmations - 1)
+
+    log.info(
+        "Bot started. Sessions=%s | Symbol=%s | min_confirmations=%s (effective=%s)",
+        cfg.trading_sessions,
+        cfg.symbol,
+        cfg.min_confirmations,
+        effective_min_confirmations,
+    )
 
     while True:
         try:
@@ -235,38 +244,55 @@ def main() -> None:
 
             confirmations, adx_val, adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
 
-            if not (adx_val >= float(cfg.adx_min)):
-                _log_dedupe(log, "adx_failed", f"ADX filter failed: {adx_val:.1f} < {float(cfg.adx_min):.1f}", dedupe_state, 180)
-                time.sleep(cfg.poll_seconds)
-                continue
-
-            if len(confirmations) < cfg.min_confirmations:
+            # ---- ADX tolerance (fix 19.9 vs 20.0) ----
+            adx_tol = 0.2
+            adx_ok = float(adx_val) >= float(cfg.adx_min) - adx_tol
+            if not adx_ok:
                 _log_dedupe(
                     log,
-                    "not_enough_confirm",
-                    f"Not enough confirmations: {len(confirmations)} (need {cfg.min_confirmations})",
+                    "adx_failed",
+                    f"ADX filter failed: {float(adx_val):.1f} < {float(cfg.adx_min):.1f} (tol={adx_tol:.1f})",
                     dedupe_state,
                     180,
                 )
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # ---- reasons ----
-            reasons: list[str] = []
-            reasons.append(f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})")
-            reasons.append(confirm_reason)
-            reasons.extend(reason_bullets)
+            # ---- Adaptive confirmations ----
+            # If you configured 5, allow 4 only when ADX is at/above min (with tolerance)
+            conf_required = cfg.min_confirmations
+            conf_effective = effective_min_confirmations if adx_ok else conf_required
 
-            tf_mode = "H1→M15→M5" if trend_tf == "1h" else "M15→M5 (fallback)"
-            risk_tag = risk_tag_from_context(trend_tf)
-            news_status = ("⚠️ " + news.message) if news.is_high_impact else "Normal"
+            if len(confirmations) < conf_effective:
+                _log_dedupe(
+                    log,
+                    "not_enough_confirm",
+                    f"Not enough confirmations: {len(confirmations)} (need {conf_effective}; cfg={conf_required})",
+                    dedupe_state,
+                    180,
+                )
+                time.sleep(cfg.poll_seconds)
+                continue
 
             # ---- entry = latest M5 close ----
             entry_price = float(df_m5["close"].iloc[-1])
 
-            # ---- M15 ATR for SL/TP2 ----
+            # ---- ENTRY deviation guard (prevents late/off-market entries) ----
+            m15_close = float(df_m15["close"].iloc[-1])
             m15_atr = atr(df_m15, period=cfg.atr_period)
+            max_dev = max(0.35 * m15_atr, entry_price * 0.0006)  # ATR-based + tiny fallback
+            if abs(entry_price - m15_close) > max_dev:
+                _log_dedupe(
+                    log,
+                    "entry_deviation",
+                    f"Entry deviation too large: entry={entry_price:.2f} vs m15_close={m15_close:.2f} (dev={abs(entry_price-m15_close):.2f} > {max_dev:.2f}). Skipping.",
+                    dedupe_state,
+                    180,
+                )
+                time.sleep(cfg.poll_seconds)
+                continue
 
+            # ---- SL/TP2 from M15 ATR ----
             tp2, sl, rr = compute_tp_sl_from_atr(
                 entry=entry_price,
                 direction=direction,
@@ -275,11 +301,23 @@ def main() -> None:
                 tp_mult=cfg.atr_tp_mult,
             )
 
-            # TP1 = 50% of TP distance
+            # TP1 = half distance to TP2
             if direction == "BUY":
                 tp1 = entry_price + (tp2 - entry_price) * 0.5
             else:
                 tp1 = entry_price - (entry_price - tp2) * 0.5
+
+            # ---- reasons ----
+            reasons: list[str] = []
+            reasons.append(f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})")
+            reasons.append(confirm_reason)
+            reasons.extend(reason_bullets)
+            reasons.append(f"M15 ATR used for SL/TP (ATR={m15_atr:.2f})")
+            reasons.append(f"Entry guard passed (|entry-m15_close| ≤ {max_dev:.2f})")
+
+            tf_mode = "H1→M15→M5" if trend_tf == "1h" else "M15→M5 (fallback)"
+            risk_tag = risk_tag_from_context(trend_tf)
+            news_status = ("⚠️ " + news.message) if news.is_high_impact else "Normal"
 
             sig = Signal(
                 symbol=cfg.symbol,
@@ -291,7 +329,7 @@ def main() -> None:
                 trend_state=trend,
                 confirmations=confirmations,
                 confirmations_passed=len(confirmations),
-                confirmations_required=cfg.min_confirmations,
+                confirmations_required=conf_required,
                 adx_value=float(adx_val),
                 adx_min=float(cfg.adx_min),
                 news_status=news_status,
@@ -307,7 +345,7 @@ def main() -> None:
             last_signal_time = now
             last_direction = direction
             log.info(
-                "Signal sent: %s %s | entry=%.2f | tp1=%.2f | tp2=%.2f | sl=%.2f | ATR(M15)=%.2f",
+                "Signal sent: %s %s | entry=%.2f | tp1=%.2f | tp2=%.2f | sl=%.2f | ATR(M15)=%.2f | conf=%d/%d",
                 direction,
                 cfg.symbol,
                 entry_price,
@@ -315,6 +353,8 @@ def main() -> None:
                 tp2,
                 sl,
                 m15_atr,
+                len(confirmations),
+                conf_effective,
             )
 
         except TwelveDataQuotaError:
