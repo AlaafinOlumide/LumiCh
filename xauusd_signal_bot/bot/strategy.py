@@ -39,9 +39,9 @@ class Signal:
     news_status: str
     reason_bullets: list[str]
 
-    # Execution fields
+    # Execution fields (optional)
     entry_price: float | None = None
-    tp: float | None = None          # TP2 (full TP)
+    tp: float | None = None
     sl: float | None = None
     rr: float | None = None
     confidence: int | None = None
@@ -75,7 +75,11 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     prev_close = close.shift(1)
 
     tr = pd.concat(
-        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
         axis=1,
     ).max(axis=1)
 
@@ -83,6 +87,10 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Lightweight ADX (Wilder-like). Enough for filtering.
+    Requires: high, low, close
+    """
     high = df["high"].astype(float)
     low = df["low"].astype(float)
 
@@ -92,17 +100,17 @@ def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    atr = _atr(df, period).replace(0, np.nan)
+    atr_s = _atr(df, period).replace(0, np.nan)
 
-    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr)
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_s)
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_s)
 
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
     adx = dx.ewm(alpha=1 / period, adjust=False).mean()
     return adx.fillna(0.0)
 
 
-def _bollinger(close: pd.Series, period: int = 20, std_mult: float = 2.0):
+def _bollinger(close: pd.Series, period: int = 20, std_mult: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
     mid = close.rolling(period).mean()
     std = close.rolling(period).std()
     upper = mid + std_mult * std
@@ -129,7 +137,13 @@ def _is_bearish_engulfing(df: pd.DataFrame) -> bool:
 # =========================
 # Public API required by main.py
 # =========================
-def detect_trend(df: pd.DataFrame, timeframe: str, ema_fast: int, ema_slow: int, ema_slope_bars: int) -> TrendState:
+def detect_trend(
+    df: pd.DataFrame,
+    timeframe: str,
+    ema_fast: int,
+    ema_slow: int,
+    ema_slope_bars: int,
+) -> TrendState:
     close = df["close"].astype(float)
     ef = _ema(close, ema_fast)
     es = _ema(close, ema_slow)
@@ -144,7 +158,12 @@ def detect_trend(df: pd.DataFrame, timeframe: str, ema_fast: int, ema_slow: int,
     else:
         diff = 0.0
 
-    slope = "UP" if diff > 0 else ("DOWN" if diff < 0 else "FLAT")
+    if diff > 0:
+        slope = "UP"
+    elif diff < 0:
+        slope = "DOWN"
+    else:
+        slope = "FLAT"
 
     if last_ef > last_es and slope == "UP":
         direction = "BULL"
@@ -153,7 +172,14 @@ def detect_trend(df: pd.DataFrame, timeframe: str, ema_fast: int, ema_slow: int,
     else:
         direction = "NEUTRAL"
 
-    return TrendState(timeframe=timeframe, direction=direction, close=last_close, ema_fast=last_ef, ema_slow=last_es, slope=slope)
+    return TrendState(
+        timeframe=timeframe,
+        direction=direction,
+        close=last_close,
+        ema_fast=last_ef,
+        ema_slow=last_es,
+        slope=slope,
+    )
 
 
 def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period: int) -> Tuple[bool, str]:
@@ -179,10 +205,14 @@ def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period
 
 
 def risk_tag_from_context(trend_tf: str) -> str:
-    return "MEDIUM" if trend_tf in ("1h", "15min") else "HIGH"
+    if trend_tf == "1h":
+        return "MEDIUM"
+    if trend_tf == "15min":
+        return "MEDIUM"
+    return "HIGH"
 
 
-def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg):
+def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str], float, bool, list[str]]:
     close = df_m5["close"].astype(float)
     ema_fast = _ema(close, cfg.ema_fast)
     rsi = _rsi(close, cfg.rsi_period)
@@ -248,57 +278,31 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg):
     return confirmations, adx_val, adx_pass, reasons
 
 
-# ===== New helpers you asked for (M15 ATR-based filters) =====
-def atr_value(df: pd.DataFrame, period: int = 14) -> float:
+# =========================
+# PUBLIC ATR + Execution helpers (EXPORTED)
+# =========================
+def atr(df: pd.DataFrame, period: int = 14) -> float:
+    """Public ATR helper (returns latest ATR value)."""
     s = _atr(df, period)
     v = float(s.iloc[-1])
     return v if v == v else 0.0
 
 
-def is_value_zone_m15(df_m15: pd.DataFrame, ema_fast: int, atr_period: int, atr_frac: float) -> tuple[bool, str]:
+def compute_tp_sl_from_atr(
+    entry: float,
+    direction: str,
+    atr_value: float,
+    sl_mult: float,
+    tp_mult: float,
+) -> tuple[float, float, float]:
     """
-    Only allow entries when price is close to EMA on M15 (prevents chasing).
-    abs(close - EMA) <= atr_frac * ATR
+    Returns: (tp, sl, rr)
     """
-    close = df_m15["close"].astype(float)
-    ema = _ema(close, ema_fast)
-    a = atr_value(df_m15, atr_period)
+    if atr_value <= 0:
+        atr_value = max(entry * 0.001, 1.0)
 
-    last_close = float(close.iloc[-1])
-    last_ema = float(ema.iloc[-1])
-
-    if a <= 0:
-        return True, "Value-zone skipped (ATR unavailable)"
-
-    dist = abs(last_close - last_ema)
-    ok = dist <= (atr_frac * a)
-    return ok, f"Value-zone: dist={dist:.2f}, limit={atr_frac*a:.2f} (ATR={a:.2f})"
-
-
-def is_range_blocked_m15(df_m15: pd.DataFrame, ema_fast: int, ema_slow: int, atr_period: int, sep_frac: float) -> tuple[bool, str]:
-    """
-    Block signals when EMA separation is too small relative to ATR (range conditions).
-    abs(EMAfast - EMAslow) < sep_frac * ATR  => range => block
-    """
-    close = df_m15["close"].astype(float)
-    ef = _ema(close, ema_fast)
-    es = _ema(close, ema_slow)
-    a = atr_value(df_m15, atr_period)
-
-    if a <= 0:
-        return False, "Range-filter skipped (ATR unavailable)"
-
-    sep = abs(float(ef.iloc[-1]) - float(es.iloc[-1]))
-    blocked = sep < (sep_frac * a)
-    return blocked, f"Range-filter: EMAsep={sep:.2f}, min={sep_frac*a:.2f} (ATR={a:.2f})"
-
-
-def compute_tp_sl_from_atr(entry: float, direction: str, atr_val: float, sl_mult: float, tp_mult: float):
-    if atr_val <= 0:
-        atr_val = max(entry * 0.001, 1.0)
-
-    sl_dist = atr_val * sl_mult
-    tp_dist = atr_val * tp_mult
+    sl_dist = atr_value * sl_mult
+    tp_dist = atr_value * tp_mult
 
     if direction == "BUY":
         sl = entry - sl_dist
