@@ -1,3 +1,4 @@
+# bot/data.py
 from __future__ import annotations
 
 import datetime as dt
@@ -65,7 +66,6 @@ class TwelveDataClient:
             msg = str(data.get("message", data))
             lower = msg.lower()
 
-            # quota exhausted
             if "run out of api credits" in lower or "out of api credits" in lower:
                 raise TwelveDataQuotaError(f"TwelveData error: {msg}")
 
@@ -126,10 +126,6 @@ class TwelveDataClient:
     # Quote (live price)
     # =========================
     def fetch_quote(self, symbol: str) -> float:
-        """
-        Fetch live quote price as float.
-        Raises TwelveDataQuotaError on credit exhaustion.
-        """
         q = self.fetch_quote_cached(symbol=symbol, ttl_seconds=2)
         return float(q.price)
 
@@ -144,7 +140,11 @@ class TwelveDataClient:
         ttl_seconds=1-3 is enough.
         """
         now = now_utc or dt.datetime.now(dt.timezone.utc)
-        sym = (symbol or "").strip()
+
+        sym = (symbol or "").strip().upper()
+        sym = sym.replace("-", "/").replace(" ", "")
+        if sym == "XAUUSD":
+            sym = "XAU/USD"
 
         cached = self._quote_cache.get(sym)
         if cached:
@@ -173,7 +173,6 @@ class TwelveDataClient:
         if price is None:
             raise TwelveDataError(f"TwelveData quote missing price. Raw={data}")
 
-        # Quote may return timestamp fields; keep a safe UTC timestamp anyway
         q = QuoteResult(
             symbol=sym,
             price=float(price),
