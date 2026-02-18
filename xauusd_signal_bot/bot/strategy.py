@@ -41,9 +41,9 @@ class Signal:
 
     # Execution fields
     entry_price: float | None = None
+    sl: float | None = None
     tp1: float | None = None
     tp2: float | None = None
-    sl: float | None = None
     rr: float | None = None
     confidence: int | None = None
     confidence_emoji: str | None = None
@@ -76,11 +76,7 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     prev_close = close.shift(1)
 
     tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
         axis=1,
     ).max(axis=1)
 
@@ -88,13 +84,8 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Lightweight ADX (Wilder-like). Enough for filtering.
-    Requires: high, low, close
-    """
     high = df["high"].astype(float)
     low = df["low"].astype(float)
-    close = df["close"].astype(float)
 
     up_move = high.diff()
     down_move = -low.diff()
@@ -102,14 +93,14 @@ def _adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-    atr = _atr(df, period).replace(0, np.nan)
+    atr_s = _atr(df, period).replace(0, np.nan)
 
-    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr)
+    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_s)
+    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_s)
 
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
-    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
-    return adx.fillna(0.0)
+    adx_s = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx_s.fillna(0.0)
 
 
 def _bollinger(close: pd.Series, period: int = 20, std_mult: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -230,7 +221,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     confirmations: list[str] = []
     reasons: list[str] = []
 
-    # 1) RSI confirmation
+    # RSI
     if direction == "BUY" and last_rsi >= 50:
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≥ 50)")
@@ -238,7 +229,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≤ 50)")
 
-    # 2) EMA pullback / location
+    # EMA location
     if direction == "BUY" and last_close >= last_ema:
         confirmations.append("EMA Pullback")
         reasons.append(f"Price above EMA{cfg.ema_fast} (continuation bias)")
@@ -246,7 +237,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("EMA Pullback")
         reasons.append(f"Price below EMA{cfg.ema_fast} (continuation bias)")
 
-    # 3) Engulfing candle
+    # Engulfing
     if direction == "BUY" and _is_bullish_engulfing(df_m5):
         confirmations.append("Engulfing")
         reasons.append("Bullish engulfing present on M5")
@@ -254,7 +245,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("Engulfing")
         reasons.append("Bearish engulfing present on M5")
 
-    # 4) BB expansion
+    # Bollinger expansion
     last_upper = float(upper.iloc[-1]) if not np.isnan(upper.iloc[-1]) else last_close
     last_lower = float(lower.iloc[-1]) if not np.isnan(lower.iloc[-1]) else last_close
     bb_width = max(0.0, last_upper - last_lower)
@@ -271,7 +262,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
             confirmations.append("BB Expansion")
             reasons.append("Bollinger width expanding (volatility pickup)")
 
-    # 5) Momentum
+    # Momentum
     if len(close) >= 2:
         prev_close = float(close.iloc[-2])
         if direction == "BUY" and last_close > prev_close:
@@ -289,51 +280,34 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
 # ATR + Execution helpers
 # =========================
 def atr(df: pd.DataFrame, period: int = 14) -> float:
-    """Public ATR function (main.py imports this)."""
     s = _atr(df, period)
     v = float(s.iloc[-1])
     return v if v == v else 0.0
 
 
-def compute_sl_tp2_tp1_from_atr(
+def compute_tp_sl_from_atr(
     entry: float,
     direction: str,
     atr_value: float,
     sl_mult: float,
     tp_mult: float,
 ) -> tuple[float, float, float]:
-    """
-    Returns (sl, tp2, tp1)
-    - TP2 is the original TP distance (atr*tp_mult)
-    - TP1 is half-way to TP2 (50% of TP2 distance)
-    """
     if atr_value <= 0:
         atr_value = max(entry * 0.001, 1.0)
 
     sl_dist = atr_value * sl_mult
-    tp2_dist = atr_value * tp_mult
-    tp1_dist = tp2_dist * 0.5
+    tp_dist = atr_value * tp_mult
 
     if direction == "BUY":
         sl = entry - sl_dist
-        tp2 = entry + tp2_dist
-        tp1 = entry + tp1_dist
+        tp = entry + tp_dist
+        rr = (tp - entry) / (entry - sl) if (entry - sl) != 0 else 0.0
     else:
         sl = entry + sl_dist
-        tp2 = entry - tp2_dist
-        tp1 = entry - tp1_dist
+        tp = entry - tp_dist
+        rr = (entry - tp) / (sl - entry) if (sl - entry) != 0 else 0.0
 
-    return float(sl), float(tp2), float(tp1)
-
-
-def rr_from_sl_tp(entry: float, direction: str, sl: float, tp: float) -> float:
-    if direction == "BUY":
-        risk = entry - sl
-        reward = tp - entry
-    else:
-        risk = sl - entry
-        reward = entry - tp
-    return float(reward / risk) if risk != 0 else 0.0
+    return float(tp), float(sl), float(rr)
 
 
 def confidence_score(
@@ -354,7 +328,6 @@ def confidence_score(
         adx_bonus = 15.0
 
     news_adj = 10.0 if news_is_normal else -10.0
-
     score = int(max(0, min(100, base + adx_bonus + news_adj)))
 
     if score >= 75:
