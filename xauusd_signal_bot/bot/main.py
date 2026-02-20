@@ -43,8 +43,7 @@ def _log_dedupe(log: logging.Logger, key: str, message: str, dedupe_state: dict,
 
 
 def _is_weekend_utc(now: dt.datetime) -> bool:
-    # Monday=0 ... Sunday=6
-    return now.weekday() >= 5
+    return now.weekday() >= 5  # Sat/Sun
 
 
 def _safe_float(x: Optional[float], fallback: float) -> float:
@@ -94,7 +93,9 @@ def fmt_signal(
     t = sig.trend_state
     lines.append("*Trend (HTF)*")
     lines.append(f"- TF: `{t.timeframe}` | Dir: *{t.direction}* | Close: {t.close:.2f}")
-    lines.append(f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}")
+    lines.append(
+        f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}"
+    )
     lines.append("")
 
     lines.append("*Filters & Confirmations*")
@@ -126,30 +127,36 @@ def main() -> None:
     if not sessions:
         raise RuntimeError("No TRADING_SESSIONS configured")
 
-    # ✅ TwelveData client now supports retries/backoff
-    td = TwelveDataClient(cfg.twelvedata_api_key, timeout=20, max_retries=2, backoff_seconds=1.0)
+    td = TwelveDataClient(
+        cfg.twelvedata_api_key,
+        timeout=20,
+        max_retries=2,
+        backoff_seconds=1.0,
+    )
     tg = TelegramClient(cfg.telegram_bot_token, cfg.telegram_chat_id)
 
     last_signal_time: dt.datetime | None = None
     last_direction: str | None = None
     dedupe_state: dict[str, float] = {}
 
-    # If your MT5 price is usually (MT5 - TwelveData) = -18.0, set BROKER_PRICE_OFFSET=-18.0
-    broker_offset = float(getattr(cfg, "broker_price_offset", 0.0)) if hasattr(cfg, "broker_price_offset") else 0.0
+    broker_offset = float(cfg.broker_price_offset)
 
     log.info(
-        "Bot started. Sessions=%s | Symbol=%s | min_confirmations=%s",
+        "Bot started. Sessions=%s | Symbol=%s | min_confirmations=%s | ADX_MIN=%.1f | BLOCK_WEEKENDS=%s | OFFSET=%.2f",
         cfg.trading_sessions,
         cfg.symbol,
         cfg.min_confirmations,
+        cfg.adx_min,
+        cfg.block_weekends,
+        broker_offset,
     )
 
     while True:
         try:
             now = dt.datetime.now(dt.timezone.utc)
 
-            # ✅ Block weekends
-            if _is_weekend_utc(now):
+            # ✅ Weekend block controlled by env
+            if cfg.block_weekends and _is_weekend_utc(now):
                 _log_dedupe(
                     log,
                     key="weekend_block",
@@ -177,9 +184,9 @@ def main() -> None:
             news = check_high_impact_news(
                 provider=cfg.news_api_provider or "fmp",
                 api_key=cfg.news_api_key or "",
-                base_url=getattr(cfg, "news_base_url", None),
-                lookahead_min=getattr(cfg, "news_lookahead_min", 60),
-                cooldown_after_min=getattr(cfg, "news_cooldown_after_min", 30),
+                base_url=cfg.news_base_url,
+                lookahead_min=cfg.news_lookahead_min,
+                cooldown_after_min=cfg.news_cooldown_after_min,
                 now_utc=now,
                 ttl_seconds=300,
             )
@@ -262,7 +269,6 @@ def main() -> None:
 
             confirmations, adx_val, _adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
 
-            # Confirmations gate
             if len(confirmations) < cfg.min_confirmations:
                 _log_dedupe(
                     log,
@@ -274,7 +280,6 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # ADX gate
             if adx_val < float(cfg.adx_min):
                 _log_dedupe(
                     log,
@@ -288,7 +293,9 @@ def main() -> None:
 
             # Reasons
             reasons: list[str] = []
-            reasons.append(f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})")
+            reasons.append(
+                f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})"
+            )
             reasons.append(confirm_reason)
             reasons.extend(reason_bullets)
 
@@ -323,8 +330,7 @@ def main() -> None:
             else:
                 tp1 = entry_price - (entry_price - tp2) * 0.5
 
-            # ✅ Entry zone (ATR15-based): helps “entry discrepancy” psychologically + practically
-            # widen slightly so it’s usable
+            # ✅ Entry zone
             zone_half = max(atr_m15 * 0.25, 2.0)
             entry_zone_low = entry_price - zone_half
             entry_zone_high = entry_price + zone_half
@@ -361,6 +367,7 @@ def main() -> None:
                 confidence_emoji=emoji,
             )
 
+            src = entry_source + (f" + offset({broker_offset:+.2f})" if broker_offset else "")
             tg.send_message(
                 fmt_signal(
                     sig=sig,
@@ -371,7 +378,7 @@ def main() -> None:
                     rr=rr,
                     confidence=conf,
                     emoji=emoji,
-                    entry_source=entry_source + (f" + offset({broker_offset:+.2f})" if broker_offset else ""),
+                    entry_source=src,
                     entry_zone_low=entry_zone_low,
                     entry_zone_high=entry_zone_high,
                     atr_m15=atr_m15,
@@ -380,7 +387,7 @@ def main() -> None:
 
             last_signal_time = now
             last_direction = direction
-            log.info("Signal sent: %s %s | entry=%.2f (%s)", direction, cfg.symbol, entry_price, entry_source)
+            log.info("Signal sent: %s %s | entry=%.2f (%s)", direction, cfg.symbol, entry_price, src)
 
         except TwelveDataQuotaError:
             log.error("TwelveData daily credits exhausted. Sleeping 3600s.")
