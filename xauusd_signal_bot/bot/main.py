@@ -126,6 +126,7 @@ def main() -> None:
     if not sessions:
         raise RuntimeError("No TRADING_SESSIONS configured")
 
+    # ✅ TwelveData client now supports retries/backoff
     td = TwelveDataClient(cfg.twelvedata_api_key, timeout=20, max_retries=2, backoff_seconds=1.0)
     tg = TelegramClient(cfg.telegram_bot_token, cfg.telegram_chat_id)
 
@@ -133,7 +134,6 @@ def main() -> None:
     last_direction: str | None = None
     dedupe_state: dict[str, float] = {}
 
-    # Optional: calibrate closer to your MT5 broker price feed.
     # If your MT5 price is usually (MT5 - TwelveData) = -18.0, set BROKER_PRICE_OFFSET=-18.0
     broker_offset = float(getattr(cfg, "broker_price_offset", 0.0)) if hasattr(cfg, "broker_price_offset") else 0.0
 
@@ -274,7 +274,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # ADX gate (simple + strict)
+            # ADX gate
             if adx_val < float(cfg.adx_min):
                 _log_dedupe(
                     log,
@@ -296,7 +296,7 @@ def main() -> None:
             risk_tag = risk_tag_from_context(trend_tf)
             news_status = ("⚠️ " + news.message) if news.is_high_impact else "Normal"
 
-            # ✅ Entry: use quote, fallback to M5 close if quote fails
+            # ✅ Entry: quote first, fallback to M5 close
             entry_source = "QUOTE"
             try:
                 q = td.fetch_quote_cached(cfg.symbol, ttl_seconds=2, now_utc=now)
@@ -304,10 +304,11 @@ def main() -> None:
             except (TwelveDataError, Exception) as e:
                 log.warning("Quote unavailable (%s). Falling back to M5 close.", e)
                 entry_source = "M5_CLOSE"
-                entry_price = float(df_m5["close"].iloc[-1])
+                entry_price = float(df_m5["close"].iloc[-1]) + broker_offset
 
             # ✅ Risk model uses M15 ATR (more stable)
             atr_m15 = atr_value(df_m15, cfg.atr_period)
+
             tp2, sl, rr = compute_tp_sl_from_atr(
                 entry=entry_price,
                 direction=direction,
@@ -322,8 +323,9 @@ def main() -> None:
             else:
                 tp1 = entry_price - (entry_price - tp2) * 0.5
 
-            # ✅ Entry zone based on ATR15 (prevents “wrong entry” feeling)
-            zone_half = max(atr_m15 * 0.25, 2.0)  # at least $2 width
+            # ✅ Entry zone (ATR15-based): helps “entry discrepancy” psychologically + practically
+            # widen slightly so it’s usable
+            zone_half = max(atr_m15 * 0.25, 2.0)
             entry_zone_low = entry_price - zone_half
             entry_zone_high = entry_price + zone_half
 
@@ -369,7 +371,7 @@ def main() -> None:
                     rr=rr,
                     confidence=conf,
                     emoji=emoji,
-                    entry_source=entry_source,
+                    entry_source=entry_source + (f" + offset({broker_offset:+.2f})" if broker_offset else ""),
                     entry_zone_low=entry_zone_low,
                     entry_zone_high=entry_zone_high,
                     atr_m15=atr_m15,
