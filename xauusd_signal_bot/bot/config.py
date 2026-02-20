@@ -77,7 +77,7 @@ class Config:
     min_confirmations: int
     cooldown_minutes: int
 
-    # ATR-based risk model (NEW)
+    # ATR-based risk model
     atr_period: int
     atr_sl_mult: float
     atr_tp_mult: float
@@ -90,9 +90,16 @@ class Config:
     news_lookahead_min: int
     news_cooldown_after_min: int
 
-    # No-trade alerts (NEW)
+    # No-trade alerts
     send_no_trade_alerts: bool
     no_trade_alert_cooldown_min: int
+
+    # ✅ NEW: price calibration (fixes discrepancy with MT5 broker feed)
+    broker_price_offset: float
+
+    # ✅ NEW: weekend blocking
+    block_weekends: bool
+    weekend_timezone: str  # informational (we use UTC in code)
 
     @staticmethod
     def from_env() -> "Config":
@@ -117,7 +124,6 @@ class Config:
             min_confirmations=_env_int("MIN_CONFIRMATIONS", 5),
             cooldown_minutes=_env_int("COOLDOWN_MINUTES", 30),
 
-            # ATR model defaults
             atr_period=_env_int("ATR_PERIOD", 14),
             atr_sl_mult=_env_float("ATR_SL_MULT", 1.5),
             atr_tp_mult=_env_float("ATR_TP_MULT", 3.0),
@@ -131,4 +137,9 @@ class Config:
 
             send_no_trade_alerts=_env_bool("SEND_NO_TRADE_ALERTS", True),
             no_trade_alert_cooldown_min=_env_int("NO_TRADE_ALERT_COOLDOWN_MIN", 20),
+
+            # ✅ NEW ENV VARS
+            broker_price_offset=_env_float("BROKER_PRICE_OFFSET", 0.0),
+            block_weekends=_env_bool("BLOCK_WEEKENDS", True),
+            weekend_timezone=_env("WEEKEND_TIMEZONE", "UTC") or "UTC",
         )
