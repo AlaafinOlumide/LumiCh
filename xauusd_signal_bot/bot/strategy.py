@@ -128,7 +128,7 @@ def _is_bearish_engulfing(df: pd.DataFrame) -> bool:
 
 
 # =========================
-# Public API required by main.py
+# Trend + HTF confirm
 # =========================
 def detect_trend(
     df: pd.DataFrame,
@@ -151,12 +151,7 @@ def detect_trend(
     else:
         diff = 0.0
 
-    if diff > 0:
-        slope = "UP"
-    elif diff < 0:
-        slope = "DOWN"
-    else:
-        slope = "FLAT"
+    slope = "UP" if diff > 0 else ("DOWN" if diff < 0 else "FLAT")
 
     if last_ef > last_es and slope == "UP":
         direction = "BULL"
@@ -198,22 +193,27 @@ def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period
 
 
 def risk_tag_from_context(trend_tf: str) -> str:
-    if trend_tf == "1h":
-        return "MEDIUM"
-    if trend_tf == "15min":
+    if trend_tf in ("1h", "15min"):
         return "MEDIUM"
     return "HIGH"
 
 
+# =========================
+# Setup quality (M5) — prevents peak chasing
+# =========================
 def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str], float, bool, list[str]]:
     close = df_m5["close"].astype(float)
+    open_ = df_m5["open"].astype(float)
+    high = df_m5["high"].astype(float)
+    low = df_m5["low"].astype(float)
+
     ema_fast = _ema(close, cfg.ema_fast)
     rsi = _rsi(close, cfg.rsi_period)
     adx_series = _adx(df_m5, cfg.adx_period)
-
     lower, mid, upper = _bollinger(close, 20, 2.0)
 
     last_close = float(close.iloc[-1])
+    last_open = float(open_.iloc[-1])
     last_ema = float(ema_fast.iloc[-1])
     last_rsi = float(rsi.iloc[-1])
     adx_val = float(adx_series.iloc[-1])
@@ -221,7 +221,38 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     confirmations: list[str] = []
     reasons: list[str] = []
 
-    # RSI
+    # ---------
+    # Peak/extension guards
+    # ---------
+    atr_m5 = float(_atr(df_m5, getattr(cfg, "atr_period", 14)).iloc[-1])
+    if not (atr_m5 == atr_m5) or atr_m5 <= 0:
+        atr_m5 = max(last_close * 0.001, 1.0)
+
+    ema_gap = abs(last_close - last_ema)
+    if ema_gap > float(cfg.ext_atr_mult) * atr_m5:
+        reasons.append(f"Blocked: overextended vs EMA (gap {ema_gap:.2f} > {cfg.ext_atr_mult:.2f}*ATR {atr_m5:.2f})")
+        return [], adx_val, False, reasons
+
+    if direction == "BUY" and last_rsi > float(cfg.rsi_buy_max):
+        reasons.append(f"Blocked: RSI too high for BUY ({last_rsi:.1f} > {cfg.rsi_buy_max:.1f})")
+        return [], adx_val, False, reasons
+    if direction == "SELL" and last_rsi < float(cfg.rsi_sell_min):
+        reasons.append(f"Blocked: RSI too low for SELL ({last_rsi:.1f} < {cfg.rsi_sell_min:.1f})")
+        return [], adx_val, False, reasons
+
+    last_upper = float(upper.iloc[-1]) if not np.isnan(upper.iloc[-1]) else last_close
+    last_lower = float(lower.iloc[-1]) if not np.isnan(lower.iloc[-1]) else last_close
+    band_buffer = float(cfg.bb_band_buffer_atr) * atr_m5
+    if direction == "BUY" and last_close >= (last_upper - band_buffer):
+        reasons.append("Blocked: BUY near upper Bollinger band (possible exhaustion)")
+        return [], adx_val, False, reasons
+    if direction == "SELL" and last_close <= (last_lower + band_buffer):
+        reasons.append("Blocked: SELL near lower Bollinger band (possible exhaustion)")
+        return [], adx_val, False, reasons
+
+    # ---------
+    # Confirmations (setup quality)
+    # ---------
     if direction == "BUY" and last_rsi >= 50:
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≥ 50)")
@@ -229,13 +260,24 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≤ 50)")
 
-    # EMA location
-    if direction == "BUY" and last_close >= last_ema:
-        confirmations.append("EMA Pullback")
-        reasons.append(f"Price above EMA{cfg.ema_fast} (continuation bias)")
-    elif direction == "SELL" and last_close <= last_ema:
-        confirmations.append("EMA Pullback")
-        reasons.append(f"Price below EMA{cfg.ema_fast} (continuation bias)")
+    # Pullback+Rejection (timing fix)
+    lookback = int(cfg.pullback_lookback)
+    touched = False
+    for i in range(1, min(lookback + 1, len(df_m5))):
+        if float(low.iloc[-i]) <= float(ema_fast.iloc[-i]) <= float(high.iloc[-i]):
+            touched = True
+            break
+
+    if direction == "BUY":
+        rejection = (last_close > last_ema) and (last_close > last_open)
+        if touched and rejection:
+            confirmations.append("Pullback+Rejection")
+            reasons.append("M5 pulled back to EMA then rejected upward")
+    else:
+        rejection = (last_close < last_ema) and (last_close < last_open)
+        if touched and rejection:
+            confirmations.append("Pullback+Rejection")
+            reasons.append("M5 pulled back to EMA then rejected downward")
 
     # Engulfing
     if direction == "BUY" and _is_bullish_engulfing(df_m5):
@@ -245,39 +287,77 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         confirmations.append("Engulfing")
         reasons.append("Bearish engulfing present on M5")
 
-    # Bollinger expansion
-    last_upper = float(upper.iloc[-1]) if not np.isnan(upper.iloc[-1]) else last_close
-    last_lower = float(lower.iloc[-1]) if not np.isnan(lower.iloc[-1]) else last_close
+    # BB expansion (keep, but not a peak trigger)
     bb_width = max(0.0, last_upper - last_lower)
-
-    if bb_width > 0:
-        if len(upper) > 6:
-            prev_upper = float(upper.iloc[-6]) if not np.isnan(upper.iloc[-6]) else last_upper
-            prev_lower = float(lower.iloc[-6]) if not np.isnan(lower.iloc[-6]) else last_lower
-            prev_width = max(0.0, prev_upper - prev_lower)
-        else:
-            prev_width = bb_width
-
+    if bb_width > 0 and len(upper) > 6:
+        prev_upper = float(upper.iloc[-6]) if not np.isnan(upper.iloc[-6]) else last_upper
+        prev_lower = float(lower.iloc[-6]) if not np.isnan(lower.iloc[-6]) else last_lower
+        prev_width = max(0.0, prev_upper - prev_lower)
         if bb_width >= prev_width:
             confirmations.append("BB Expansion")
             reasons.append("Bollinger width expanding (volatility pickup)")
-
-    # Momentum
-    if len(close) >= 2:
-        prev_close = float(close.iloc[-2])
-        if direction == "BUY" and last_close > prev_close:
-            confirmations.append("Momentum")
-            reasons.append("Positive momentum (last candle closing higher)")
-        elif direction == "SELL" and last_close < prev_close:
-            confirmations.append("Momentum")
-            reasons.append("Negative momentum (last candle closing lower)")
 
     adx_pass = adx_val >= float(cfg.adx_min)
     return confirmations, adx_val, adx_pass, reasons
 
 
 # =========================
-# ATR + Execution helpers
+# Trigger (M1) — enter only on pullback inside zone + rejection
+# =========================
+def trigger_entry_m1(
+    df_m1: pd.DataFrame,
+    direction: str,
+    ema_period: int,
+    rsi_period: int,
+    rsi_min_buy: float,
+    rsi_max_sell: float,
+    zone_low: float,
+    zone_high: float,
+    live_price: float,
+) -> tuple[bool, str]:
+    """
+    Trigger when:
+      - live price is inside zone
+      - last M1 candle shows rejection in direction
+      - price is on correct side of EMA (after rejection)
+      - RSI not weak
+    """
+    if not (zone_low <= live_price <= zone_high):
+        return False, "Price not inside entry zone"
+
+    close = df_m1["close"].astype(float)
+    open_ = df_m1["open"].astype(float)
+
+    ema = _ema(close, ema_period)
+    rsi = _rsi(close, rsi_period)
+
+    last_close = float(close.iloc[-1])
+    last_open = float(open_.iloc[-1])
+    last_ema = float(ema.iloc[-1])
+    last_rsi = float(rsi.iloc[-1])
+
+    if direction == "BUY":
+        # bullish rejection candle + close above EMA
+        if not (last_close > last_open):
+            return False, "M1 not bullish rejection candle"
+        if not (last_close >= last_ema):
+            return False, f"M1 close below EMA{ema_period}"
+        if not (last_rsi >= rsi_min_buy):
+            return False, f"M1 RSI weak ({last_rsi:.1f} < {rsi_min_buy:.1f})"
+        return True, "Triggered: M1 bullish rejection inside zone"
+
+    # SELL
+    if not (last_close < last_open):
+        return False, "M1 not bearish rejection candle"
+    if not (last_close <= last_ema):
+        return False, f"M1 close above EMA{ema_period}"
+    if not (last_rsi <= rsi_max_sell):
+        return False, f"M1 RSI weak ({last_rsi:.1f} > {rsi_max_sell:.1f})"
+    return True, "Triggered: M1 bearish rejection inside zone"
+
+
+# =========================
+# ATR + execution
 # =========================
 def atr(df: pd.DataFrame, period: int = 14) -> float:
     s = _atr(df, period)
