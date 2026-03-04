@@ -8,7 +8,6 @@ from typing import Any, Dict, Tuple, Optional
 
 import pandas as pd
 import requests
-from requests import Response
 
 
 log = logging.getLogger(__name__)
@@ -37,71 +36,43 @@ class QuoteResult:
 
 
 class TwelveDataClient:
-    """
-    TwelveData client with:
-    - retry + backoff on timeouts / transient network errors / 5xx
-    - cached time series per timeframe
-    - cached quote with short TTL
-    """
-
-    def __init__(
-        self,
-        api_key: str,
-        timeout: int = 20,
-        max_retries: int = 2,
-        backoff_seconds: float = 1.0,
-    ) -> None:
+    def __init__(self, api_key: str, timeout: int = 20, max_retries: int = 2, backoff_seconds: float = 1.0) -> None:
         self.api_key = api_key
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.backoff_seconds = backoff_seconds
+        self.timeout = int(timeout)
+        self.max_retries = int(max_retries)
+        self.backoff_seconds = float(backoff_seconds)
 
         self.base_url = "https://api.twelvedata.com/time_series"
         self.quote_url = "https://api.twelvedata.com/quote"
 
-        self._session = requests.Session()
-
         # cache:
-        # - time series: key -> (fetched_at_utc, result)
-        # - quote: symbol -> (fetched_at_utc, quote)
         self._cache: Dict[Tuple[str, str, int], Tuple[dt.datetime, TimeSeriesResult]] = {}
         self._quote_cache: Dict[str, Tuple[dt.datetime, QuoteResult]] = {}
 
-    # -------------------------
-    # Low-level HTTP with retry
-    # -------------------------
-    def _request_with_retry(self, method: str, url: str, *, params: dict | None = None, data: dict | None = None) -> Response:
-        last_exc: Exception | None = None
+        self._session = requests.Session()
 
+    def _request_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        last_err: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
-                r = self._session.request(method, url, params=params, data=data, timeout=self.timeout)
-
-                # Retry on 5xx (transient)
-                if 500 <= r.status_code <= 599:
-                    raise TwelveDataError(f"TwelveData 5xx error {r.status_code}: {r.text[:200]}")
-
+                r = self._session.get(url, params=params, timeout=self.timeout)
                 r.raise_for_status()
-                return r
+                return r.json()
+            except requests.exceptions.ReadTimeout as e:
+                last_err = e
+                if attempt < self.max_retries:
+                    time.sleep(self.backoff_seconds * (attempt + 1))
+                    continue
+                raise
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                if attempt < self.max_retries:
+                    time.sleep(self.backoff_seconds * (attempt + 1))
+                    continue
+                raise
+        raise TwelveDataError(f"HTTP request failed: {last_err}")
 
-            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectTimeout) as e:
-                last_exc = e
-            except requests.exceptions.ConnectionError as e:
-                last_exc = e
-            except TwelveDataError as e:
-                # includes our synthetic 5xx raise
-                last_exc = e
-            except Exception as e:
-                last_exc = e
-
-            # backoff before next attempt
-            if attempt < self.max_retries:
-                sleep_s = self.backoff_seconds * (attempt + 1)
-                time.sleep(sleep_s)
-
-        raise TwelveDataError(f"TwelveData request failed after retries: {last_exc}")
-
-    def _raise_if_error_payload(self, data: Dict[str, Any]) -> None:
+    def _raise_if_error(self, data: Dict[str, Any]) -> None:
         if str(data.get("status", "")).lower() == "error":
             msg = str(data.get("message", data))
             lower = msg.lower()
@@ -109,22 +80,17 @@ class TwelveDataClient:
                 raise TwelveDataQuotaError(f"TwelveData error: {msg}")
             raise TwelveDataError(f"TwelveData error: {msg}")
 
-    # -------------------------
-    # Time series
-    # -------------------------
     def fetch_time_series(self, symbol: str, interval: str, outputsize: int = 200) -> TimeSeriesResult:
         params = {
             "symbol": symbol,
             "interval": interval,
-            "outputsize": outputsize,
+            "outputsize": int(outputsize),
             "apikey": self.api_key,
             "format": "JSON",
         }
 
-        r = self._request_with_retry("GET", self.base_url, params=params)
-        data: Dict[str, Any] = r.json()
-
-        self._raise_if_error_payload(data)
+        data: Dict[str, Any] = self._request_json(self.base_url, params=params)
+        self._raise_if_error(data)
 
         values = data.get("values", [])
         if not values:
@@ -132,12 +98,10 @@ class TwelveDataClient:
 
         df = pd.DataFrame(values)
 
-        # normalize OHLC columns
         for c in ["open", "high", "low", "close"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        # normalize time
         if "datetime" in df.columns:
             df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
             df = df.sort_values("datetime").reset_index(drop=True)
@@ -145,10 +109,6 @@ class TwelveDataClient:
 
         if "time" not in df.columns:
             df["time"] = pd.to_datetime(df.index, utc=True)
-
-        # drop rows with NaN close to avoid indicator explosions
-        if "close" in df.columns:
-            df = df[df["close"].notna()].reset_index(drop=True)
 
         return TimeSeriesResult(df=df, raw=data)
 
@@ -160,84 +120,35 @@ class TwelveDataClient:
         ttl_seconds: int = 300,
         now_utc: dt.datetime | None = None,
     ) -> TimeSeriesResult:
-        """
-        Cache per timeframe to reduce API calls drastically.
-        ttl_seconds should match timeframe:
-          - 1min  => 60
-          - 5min  => 300
-          - 15min => 900
-          - 1h    => 3600
-        """
         now = now_utc or dt.datetime.now(dt.timezone.utc)
         key = (symbol, interval, int(outputsize))
 
         cached = self._cache.get(key)
         if cached:
             fetched_at, result = cached
-            age = (now - fetched_at).total_seconds()
-            if age < ttl_seconds:
+            if (now - fetched_at).total_seconds() < ttl_seconds:
                 return result
 
         result = self.fetch_time_series(symbol, interval, outputsize=outputsize)
         self._cache[key] = (now, result)
         return result
 
-    # -------------------------
-    # Quote (live price)
-    # -------------------------
-    def fetch_quote(self, symbol: str) -> float:
-        q = self.fetch_quote_cached(symbol=symbol, ttl_seconds=2)
-        return float(q.price)
-
-    def _extract_quote_price(self, data: Dict[str, Any]) -> Optional[float]:
-        """
-        TwelveData /quote sometimes returns:
-          - price
-        or (for some instruments/accounts):
-          - close (as string)
-        We'll accept: price -> close -> previous_close.
-        """
-        for k in ("price", "close", "previous_close"):
-            v = data.get(k)
-            if v is None:
-                continue
-            try:
-                return float(v)
-            except Exception:
-                continue
-        return None
-
-    def _extract_quote_timestamp(self, data: Dict[str, Any], fallback_now: dt.datetime) -> dt.datetime:
-        """
-        Prefer last_quote_at (epoch seconds) -> timestamp (epoch seconds) -> fallback_now.
-        """
-        for k in ("last_quote_at", "timestamp"):
-            v = data.get(k)
-            try:
-                if v is not None:
-                    return dt.datetime.fromtimestamp(int(v), tz=dt.timezone.utc)
-            except Exception:
-                pass
-        return fallback_now
-
+    # =========================
+    # Quote
+    # =========================
     def fetch_quote_cached(
         self,
         symbol: str,
         ttl_seconds: int = 2,
         now_utc: dt.datetime | None = None,
     ) -> QuoteResult:
-        """
-        Very short TTL quote cache to avoid burning credits.
-        ttl_seconds=1-3 is enough.
-        """
         now = now_utc or dt.datetime.now(dt.timezone.utc)
         sym = (symbol or "").strip()
 
         cached = self._quote_cache.get(sym)
         if cached:
             fetched_at, q = cached
-            age = (now - fetched_at).total_seconds()
-            if age < ttl_seconds:
+            if (now - fetched_at).total_seconds() < ttl_seconds:
                 return q
 
         params = {
@@ -246,23 +157,39 @@ class TwelveDataClient:
             "format": "JSON",
         }
 
-        r = self._request_with_retry("GET", self.quote_url, params=params)
-        data: Dict[str, Any] = r.json()
+        data: Dict[str, Any] = self._request_json(self.quote_url, params=params)
+        self._raise_if_error(data)
 
-        self._raise_if_error_payload(data)
+        # TwelveData quote sometimes returns 'price' OR only OHLC with 'close'
+        price_raw = data.get("price", None)
+        if price_raw is None:
+            price_raw = data.get("close", None)
 
-        price = self._extract_quote_price(data)
-        if price is None:
+        if price_raw is None:
             raise TwelveDataError(f"TwelveData quote missing price/close. Raw={data}")
 
-        ts = self._extract_quote_timestamp(data, now)
+        try:
+            price = float(price_raw)
+        except Exception:
+            raise TwelveDataError(f"TwelveData quote invalid price/close. Raw={data}")
+
+        # Prefer seconds timestamp if present
+        ts = None
+        for k in ("last_quote_at", "timestamp"):
+            v = data.get(k)
+            if v is not None:
+                try:
+                    ts = dt.datetime.fromtimestamp(int(v), tz=dt.timezone.utc)
+                    break
+                except Exception:
+                    pass
+        timestamp_utc = ts or now
 
         q = QuoteResult(
             symbol=sym,
             price=float(price),
-            timestamp_utc=ts,
+            timestamp_utc=timestamp_utc,
             raw=data,
         )
-
         self._quote_cache[sym] = (now, q)
         return q
