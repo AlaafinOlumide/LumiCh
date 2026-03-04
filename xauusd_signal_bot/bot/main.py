@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -16,6 +17,7 @@ from .strategy import (
     m15_confirms,
     risk_tag_from_context,
     score_entry_m5,
+    trigger_entry_m1,
     Signal,
     atr as atr_value,
     compute_tp_sl_from_atr,
@@ -46,69 +48,86 @@ def _is_weekend_utc(now: dt.datetime) -> bool:
     return now.weekday() >= 5  # Sat/Sun
 
 
-def _safe_float(x: Optional[float], fallback: float) -> float:
+def _safe_entry_from_quote_or_close(td: TwelveDataClient, symbol: str, df_m5, now: dt.datetime, offset: float) -> tuple[float, str]:
     try:
-        if x is None:
-            return fallback
-        v = float(x)
-        if v != v:
-            return fallback
-        return v
-    except Exception:
-        return fallback
+        q = td.fetch_quote_cached(symbol, ttl_seconds=2, now_utc=now)
+        return float(q.price) + offset, "QUOTE"
+    except (TwelveDataError, Exception):
+        return float(df_m5["close"].iloc[-1]), "M5_CLOSE"
 
 
-def fmt_signal(
-    sig: Signal,
-    entry: float,
-    sl: float,
-    tp1: float,
-    tp2: float,
-    rr: float,
-    confidence: int,
-    emoji: str,
-    entry_source: str,
-    entry_zone_low: float,
-    entry_zone_high: float,
-    atr_m15: float,
-) -> str:
-    ts = sig.timestamp_utc.strftime("%Y-%m-%d %H:%M")
+@dataclass
+class SetupState:
+    created_utc: dt.datetime
+    expires_utc: dt.datetime
+    direction: str                 # "BUY"/"SELL"
+    trend_tf: str
+    session_label: str
+    risk_tag: str
+    timeframe_mode: str
+
+    # zone
+    zone_low: float
+    zone_high: float
+    atr_m15: float
+
+    # setup diagnostics
+    confirmations: list[str]
+    adx_val: float
+    reasons: list[str]
+    news_status: str
+    trend_state: object
+
+    # risk model baseline (computed off reference price at setup time)
+    sl_mult: float
+    tp_mult: float
+
+
+def fmt_setup(setup: SetupState, confidence: int, emoji: str) -> str:
+    ts = setup.created_utc.strftime("%Y-%m-%d %H:%M")
     lines: list[str] = []
-
-    lines.append(f"Xauusd: {sig.direction}")
-    lines.append(f"ENTRY: {entry:.2f}  ({entry_source})")
-    lines.append(f"ENTRY ZONE: {entry_zone_low:.2f} - {entry_zone_high:.2f}  (ATR15={atr_m15:.2f})")
-    lines.append(f"TP1: {tp1:.2f}")
-    lines.append(f"TP2: {tp2:.2f} (TP2 may not be reached — take profit when convenient)")
-    lines.append(f"SL: {sl:.2f}")
-    lines.append(f"RR (to TP2): {rr:.2f}")
+    lines.append(f"Xauusd: {setup.direction} (SETUP)")
+    lines.append(f"ENTRY ZONE: {setup.zone_low:.2f} - {setup.zone_high:.2f}  (ATR15={setup.atr_m15:.2f})")
+    lines.append("Trigger rule: waits for price to enter zone + M1 rejection candle ✅")
     lines.append(f"Confidence: {confidence}% {emoji}")
     lines.append("")
+    lines.append(f"{ts} UTC | Session: *{setup.session_label}*")
+    lines.append(f"Mode: `{setup.timeframe_mode}` | Risk: *{setup.risk_tag}*")
+    lines.append(f"Expires: {setup.expires_utc.strftime('%H:%M')} UTC")
+    lines.append("")
+    lines.append("*Filters & Confirmations (Setup Quality)*")
+    joined = ", ".join(setup.confirmations) if setup.confirmations else "None"
+    lines.append(f"- Confirmations: *{len(setup.confirmations)}/{cfg_global.min_confirmations}* ({joined})")
+    lines.append(f"- ADX: {setup.adx_val:.1f} (min {cfg_global.adx_min:.1f})")
+    lines.append(f"- News: {setup.news_status}")
+    lines.append("")
+    lines.append("*Reason for Setup*")
+    for b in setup.reasons[:8]:
+        lines.append(f"- {b}")
+    return "\n".join(lines)
 
+
+def fmt_entry(sig: Signal, entry_source: str, trigger_reason: str) -> str:
+    ts = sig.timestamp_utc.strftime("%Y-%m-%d %H:%M")
+    lines: list[str] = []
+    lines.append(f"Xauusd: {sig.direction} (ENTRY TRIGGERED)")
+    lines.append(f"ENTRY: {sig.entry_price:.2f}  ({entry_source})")
+    lines.append(f"TP1: {sig.tp1:.2f}")
+    lines.append(f"TP2: {sig.tp2:.2f} (TP2 may not be reached — take profit when convenient)")
+    lines.append(f"SL: {sig.sl:.2f}")
+    lines.append(f"RR (to TP2): {sig.rr:.2f}")
+    lines.append(f"Confidence: {sig.confidence}% {sig.confidence_emoji}")
+    lines.append("")
     lines.append(f"{ts} UTC | Session: *{sig.session_label}*")
     lines.append(f"Signal: *{sig.direction}* | Risk: *{sig.risk_tag}*")
     lines.append(f"Mode: `{sig.timeframe_mode}`")
     lines.append("")
-
-    t = sig.trend_state
-    lines.append("*Trend (HTF)*")
-    lines.append(f"- TF: `{t.timeframe}` | Dir: *{t.direction}* | Close: {t.close:.2f}")
-    lines.append(
-        f"- EMA{cfg_global.ema_fast}: {t.ema_fast:.2f} | EMA{cfg_global.ema_slow}: {t.ema_slow:.2f} | Slope: {t.slope}"
-    )
+    lines.append("*Trigger*")
+    lines.append(f"- {trigger_reason}")
     lines.append("")
-
-    lines.append("*Filters & Confirmations*")
-    joined = ", ".join(sig.confirmations) if sig.confirmations else "None"
-    lines.append(f"- Confirmations: *{sig.confirmations_passed}/{sig.confirmations_required}* ({joined})")
-    lines.append(f"- ADX: {sig.adx_value:.1f} (min {sig.adx_min:.1f})")
-    lines.append(f"- News: {sig.news_status}")
-    lines.append("")
-
     lines.append("*Reason for Trade*")
     for b in sig.reason_bullets[:8]:
         lines.append(f"- {b}")
-
     return "\n".join(lines)
 
 
@@ -129,38 +148,31 @@ def main() -> None:
 
     td = TwelveDataClient(
         cfg.twelvedata_api_key,
-        timeout=20,
-        max_retries=2,
-        backoff_seconds=1.0,
+        timeout=cfg.http_timeout,
+        max_retries=cfg.http_max_retries,
+        backoff_seconds=cfg.http_backoff_seconds,
     )
     tg = TelegramClient(cfg.telegram_bot_token, cfg.telegram_chat_id)
 
-    last_signal_time: dt.datetime | None = None
-    last_direction: str | None = None
     dedupe_state: dict[str, float] = {}
 
-    broker_offset = float(cfg.broker_price_offset)
+    last_entry_time: dt.datetime | None = None
+    last_entry_direction: str | None = None
 
-    log.info(
-        "Bot started. Sessions=%s | Symbol=%s | min_confirmations=%s | ADX_MIN=%.1f | BLOCK_WEEKENDS=%s | OFFSET=%.2f",
-        cfg.trading_sessions,
-        cfg.symbol,
-        cfg.min_confirmations,
-        cfg.adx_min,
-        cfg.block_weekends,
-        broker_offset,
-    )
+    setup_state: SetupState | None = None
+
+    log.info("Bot started. Sessions=%s | Symbol=%s | Setup→Trigger enabled", cfg.trading_sessions, cfg.symbol)
 
     while True:
         try:
             now = dt.datetime.now(dt.timezone.utc)
 
-            # ✅ Weekend block controlled by env
+            # Weekends block
             if cfg.block_weekends and _is_weekend_utc(now):
                 _log_dedupe(
                     log,
                     key="weekend_block",
-                    message=f"Weekend detected (UTC). Bot paused. Sleeping {cfg.poll_seconds}s...",
+                    message=f"Weekend (UTC). Bot paused. Sleeping {cfg.poll_seconds}s...",
                     dedupe_state=dedupe_state,
                     every_seconds=900,
                 )
@@ -180,17 +192,16 @@ def main() -> None:
 
             s_label = session_label(sessions, now)
 
-            # News check (soft-fail + cached inside)
+            # News check (soft fail inside)
             news = check_high_impact_news(
                 provider=cfg.news_api_provider or "fmp",
                 api_key=cfg.news_api_key or "",
-                base_url=cfg.news_base_url,
-                lookahead_min=cfg.news_lookahead_min,
-                cooldown_after_min=cfg.news_cooldown_after_min,
+                base_url=getattr(cfg, "news_base_url", None),
+                lookahead_min=getattr(cfg, "news_lookahead_min", 60),
+                cooldown_after_min=getattr(cfg, "news_cooldown_after_min", 30),
                 now_utc=now,
                 ttl_seconds=300,
             )
-
             if news.is_high_impact and cfg.news_mode == "BLOCK":
                 _log_dedupe(
                     log,
@@ -202,7 +213,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # Fetch candles (cached)
+            # Pull latest candles
             try:
                 trend_tf = "1h"
                 trend_df = td.fetch_time_series_cached(cfg.symbol, "1h", outputsize=200, ttl_seconds=3600, now_utc=now).df
@@ -217,123 +228,173 @@ def main() -> None:
             df_m5 = td.fetch_time_series_cached(cfg.symbol, "5min", outputsize=200, ttl_seconds=300, now_utc=now).df
 
             if len(df_m5) < 100 or len(df_m15) < 100 or len(trend_df) < 100:
-                _log_dedupe(
-                    log,
-                    key="insufficient_data",
-                    message="Insufficient data. Sleeping.",
-                    dedupe_state=dedupe_state,
-                    every_seconds=300,
-                )
+                _log_dedupe(log, "insufficient_data", "Insufficient data. Sleeping.", dedupe_state, 300)
                 time.sleep(cfg.poll_seconds)
                 continue
 
             trend = detect_trend(trend_df, trend_tf, cfg.ema_fast, cfg.ema_slow, cfg.ema_slope_bars)
             if trend.direction == "NEUTRAL":
-                _log_dedupe(
-                    log,
-                    key="trend_neutral",
-                    message="HTF trend neutral. No signals.",
-                    dedupe_state=dedupe_state,
-                    every_seconds=300,
-                )
+                _log_dedupe(log, "trend_neutral", "HTF trend neutral. No setups.", dedupe_state, 300)
+                setup_state = None
                 time.sleep(cfg.poll_seconds)
                 continue
 
             ok_confirm, confirm_reason = m15_confirms(df_m15, trend.direction, cfg.ema_fast, cfg.rsi_period)
             if not ok_confirm:
-                _log_dedupe(
-                    log,
-                    key="m15_not_confirm",
-                    message=f"M15 did not confirm. {confirm_reason}",
-                    dedupe_state=dedupe_state,
-                    every_seconds=180,
-                )
+                _log_dedupe(log, "m15_not_confirm", f"M15 did not confirm. {confirm_reason}", dedupe_state, 180)
+                setup_state = None
                 time.sleep(cfg.poll_seconds)
                 continue
 
             direction = "BUY" if trend.direction == "BULL" else "SELL"
 
-            # Cooldown logic
-            if last_signal_time is not None:
-                mins_since = (now - last_signal_time).total_seconds() / 60
-                if mins_since < cfg.cooldown_minutes and last_direction == direction:
-                    _log_dedupe(
-                        log,
-                        key="cooldown",
-                        message=f"Cooldown active ({mins_since:.1f} min). Skipping.",
-                        dedupe_state=dedupe_state,
-                        every_seconds=180,
-                    )
+            # Cooldown AFTER ENTRY (prevents re-entry spam)
+            if last_entry_time is not None:
+                mins_since = (now - last_entry_time).total_seconds() / 60
+                if mins_since < cfg.cooldown_minutes and last_entry_direction == direction:
+                    _log_dedupe(log, "cooldown", f"Cooldown active ({mins_since:.1f} min).", dedupe_state, 180)
                     time.sleep(cfg.poll_seconds)
                     continue
 
+            # If we already have a setup, try to TRIGGER it first
+            if setup_state is not None:
+                if now >= setup_state.expires_utc:
+                    _log_dedupe(log, "setup_expired", "Setup expired. Waiting for new setup.", dedupe_state, 120)
+                    setup_state = None
+                else:
+                    # if direction flipped, reset
+                    if setup_state.direction != direction:
+                        _log_dedupe(log, "setup_flip", "Trend direction flipped. Resetting setup.", dedupe_state, 120)
+                        setup_state = None
+                    else:
+                        # Live price
+                        entry_ref, entry_src = _safe_entry_from_quote_or_close(
+                            td, cfg.symbol, df_m5, now, cfg.broker_price_offset
+                        )
+
+                        # Trigger TF candles
+                        ttl_tf = 60 if cfg.trigger_tf == "1min" else 300
+                        df_m1 = td.fetch_time_series_cached(cfg.symbol, cfg.trigger_tf, outputsize=200, ttl_seconds=ttl_tf, now_utc=now).df
+
+                        trig_ok, trig_reason = trigger_entry_m1(
+                            df_m1=df_m1,
+                            direction=setup_state.direction,
+                            ema_period=cfg.trigger_ema_period,
+                            rsi_period=cfg.rsi_period,
+                            rsi_min_buy=cfg.trigger_rsi_min_buy,
+                            rsi_max_sell=cfg.trigger_rsi_max_sell,
+                            zone_low=setup_state.zone_low,
+                            zone_high=setup_state.zone_high,
+                            live_price=entry_ref,
+                        )
+
+                        if trig_ok:
+                            # Risk model uses M15 ATR (stable)
+                            atr_m15 = setup_state.atr_m15
+                            tp2, sl, rr = compute_tp_sl_from_atr(
+                                entry=entry_ref,
+                                direction=setup_state.direction,
+                                atr_value=atr_m15,
+                                sl_mult=cfg.atr_sl_mult,
+                                tp_mult=cfg.atr_tp_mult,
+                            )
+                            tp1 = entry_ref + (tp2 - entry_ref) * 0.5 if direction == "BUY" else entry_ref - (entry_ref - tp2) * 0.5
+
+                            conf, emoji = confidence_score(
+                                confirmations_passed=len(setup_state.confirmations),
+                                confirmations_required=cfg.min_confirmations,
+                                adx_value=setup_state.adx_val,
+                                adx_min=float(cfg.adx_min),
+                                news_is_normal=not news.is_high_impact,
+                            )
+
+                            sig = Signal(
+                                symbol=cfg.symbol,
+                                timestamp_utc=now,
+                                direction=setup_state.direction,
+                                risk_tag=setup_state.risk_tag,
+                                timeframe_mode=setup_state.timeframe_mode,
+                                session_label=setup_state.session_label,
+                                trend_state=setup_state.trend_state,
+                                confirmations=setup_state.confirmations,
+                                confirmations_passed=len(setup_state.confirmations),
+                                confirmations_required=cfg.min_confirmations,
+                                adx_value=setup_state.adx_val,
+                                adx_min=float(cfg.adx_min),
+                                news_status=setup_state.news_status,
+                                reason_bullets=setup_state.reasons,
+                                entry_price=entry_ref,
+                                sl=sl,
+                                tp1=tp1,
+                                tp2=tp2,
+                                rr=rr,
+                                confidence=conf,
+                                confidence_emoji=emoji,
+                            )
+
+                            tg.send_message(fmt_entry(sig, entry_source=entry_src, trigger_reason=trig_reason))
+                            last_entry_time = now
+                            last_entry_direction = setup_state.direction
+                            setup_state = None
+                            log.info("ENTRY triggered: %s %s @ %.2f", sig.direction, cfg.symbol, entry_ref)
+
+                        time.sleep(cfg.poll_seconds)
+                        continue  # important: don't generate a new setup in same loop
+
+            # ----------------------------
+            # Build NEW SETUP (if none active)
+            # ----------------------------
             confirmations, adx_val, _adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
 
             if len(confirmations) < cfg.min_confirmations:
-                _log_dedupe(
-                    log,
-                    key="not_enough_confirm",
-                    message=f"Not enough confirmations: {len(confirmations)} (need {cfg.min_confirmations})",
-                    dedupe_state=dedupe_state,
-                    every_seconds=180,
-                )
+                _log_dedupe(log, "not_enough_confirm", f"Not enough confirmations: {len(confirmations)} (need {cfg.min_confirmations})", dedupe_state, 180)
                 time.sleep(cfg.poll_seconds)
                 continue
 
             if adx_val < float(cfg.adx_min):
-                _log_dedupe(
-                    log,
-                    key="adx_failed",
-                    message=f"ADX filter failed: {adx_val:.1f} < {float(cfg.adx_min):.1f}",
-                    dedupe_state=dedupe_state,
-                    every_seconds=180,
-                )
+                _log_dedupe(log, "adx_failed", f"ADX filter failed: {adx_val:.1f} < {float(cfg.adx_min):.1f}", dedupe_state, 180)
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            # Reasons
-            reasons: list[str] = []
-            reasons.append(
-                f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})"
-            )
-            reasons.append(confirm_reason)
-            reasons.extend(reason_bullets)
+            # Setup zone from M15 ATR
+            atr_m15 = atr_value(df_m15, cfg.atr_period)
+            zone_half = max(atr_m15 * float(cfg.entry_zone_atr_mult), float(cfg.entry_zone_min_width))
+
+            # Reference entry for zone center = live quote (or M5 close)
+            entry_ref, entry_src = _safe_entry_from_quote_or_close(td, cfg.symbol, df_m5, now, cfg.broker_price_offset)
+
+            zone_low = entry_ref - zone_half
+            zone_high = entry_ref + zone_half
 
             tf_mode = "H1→M15→M5" if trend_tf == "1h" else "M15→M5 (fallback)"
             risk_tag = risk_tag_from_context(trend_tf)
             news_status = ("⚠️ " + news.message) if news.is_high_impact else "Normal"
 
-            # ✅ Entry: quote first, fallback to M5 close
-            entry_source = "QUOTE"
-            try:
-                q = td.fetch_quote_cached(cfg.symbol, ttl_seconds=2, now_utc=now)
-                entry_price = float(q.price) + broker_offset
-            except (TwelveDataError, Exception) as e:
-                log.warning("Quote unavailable (%s). Falling back to M5 close.", e)
-                entry_source = "M5_CLOSE"
-                entry_price = float(df_m5["close"].iloc[-1]) + broker_offset
+            reasons: list[str] = []
+            reasons.append(f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})")
+            reasons.append(confirm_reason)
+            reasons.extend(reason_bullets)
 
-            # ✅ Risk model uses M15 ATR (more stable)
-            atr_m15 = atr_value(df_m15, cfg.atr_period)
-
-            tp2, sl, rr = compute_tp_sl_from_atr(
-                entry=entry_price,
+            expires = now + dt.timedelta(minutes=int(cfg.setup_ttl_minutes))
+            setup_state = SetupState(
+                created_utc=now,
+                expires_utc=expires,
                 direction=direction,
-                atr_value=atr_m15,
+                trend_tf=trend_tf,
+                session_label=s_label,
+                risk_tag=risk_tag,
+                timeframe_mode=tf_mode,
+                zone_low=zone_low,
+                zone_high=zone_high,
+                atr_m15=atr_m15,
+                confirmations=confirmations,
+                adx_val=adx_val,
+                reasons=reasons,
+                news_status=news_status,
+                trend_state=trend,
                 sl_mult=cfg.atr_sl_mult,
                 tp_mult=cfg.atr_tp_mult,
             )
-
-            # ✅ TP1 is half of TP2 distance
-            if direction == "BUY":
-                tp1 = entry_price + (tp2 - entry_price) * 0.5
-            else:
-                tp1 = entry_price - (entry_price - tp2) * 0.5
-
-            # ✅ Entry zone
-            zone_half = max(atr_m15 * 0.25, 2.0)
-            entry_zone_low = entry_price - zone_half
-            entry_zone_high = entry_price + zone_half
 
             conf, emoji = confidence_score(
                 confirmations_passed=len(confirmations),
@@ -342,58 +403,13 @@ def main() -> None:
                 adx_min=float(cfg.adx_min),
                 news_is_normal=not news.is_high_impact,
             )
-
-            sig = Signal(
-                symbol=cfg.symbol,
-                timestamp_utc=now,
-                direction=direction,
-                risk_tag=risk_tag,
-                timeframe_mode=tf_mode,
-                session_label=s_label,
-                trend_state=trend,
-                confirmations=confirmations,
-                confirmations_passed=len(confirmations),
-                confirmations_required=cfg.min_confirmations,
-                adx_value=adx_val,
-                adx_min=float(cfg.adx_min),
-                news_status=news_status,
-                reason_bullets=reasons,
-                entry_price=entry_price,
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                rr=rr,
-                confidence=conf,
-                confidence_emoji=emoji,
-            )
-
-            src = entry_source + (f" + offset({broker_offset:+.2f})" if broker_offset else "")
-            tg.send_message(
-                fmt_signal(
-                    sig=sig,
-                    entry=entry_price,
-                    sl=sl,
-                    tp1=tp1,
-                    tp2=tp2,
-                    rr=rr,
-                    confidence=conf,
-                    emoji=emoji,
-                    entry_source=src,
-                    entry_zone_low=entry_zone_low,
-                    entry_zone_high=entry_zone_high,
-                    atr_m15=atr_m15,
-                )
-            )
-
-            last_signal_time = now
-            last_direction = direction
-            log.info("Signal sent: %s %s | entry=%.2f (%s)", direction, cfg.symbol, entry_price, src)
+            tg.send_message(fmt_setup(setup_state, confidence=conf, emoji=emoji))
+            log.info("SETUP sent: %s %s zone=[%.2f..%.2f] ref=%.2f(%s)", direction, cfg.symbol, zone_low, zone_high, entry_ref, entry_src)
 
         except TwelveDataQuotaError:
             log.error("TwelveData daily credits exhausted. Sleeping 3600s.")
             time.sleep(3600)
             continue
-
         except Exception as e:
             log.exception("Loop error: %s", e)
 
