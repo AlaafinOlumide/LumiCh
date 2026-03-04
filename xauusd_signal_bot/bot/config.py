@@ -39,10 +39,6 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _normalize_symbol_for_twelvedata(sym: str | None) -> str:
-    """
-    TwelveData accepts XAU/USD (and often also XAUUSD depending on endpoint).
-    We normalize to XAU/USD by default to avoid 'symbol missing/invalid' errors.
-    """
     if not sym:
         return "XAU/USD"
     s = sym.strip().upper()
@@ -58,10 +54,13 @@ class Config:
     poll_seconds: int
 
     # Trading windows
-    trading_sessions: str  # e.g. "00:00-03:00,07:00-11:00,12:00-20:00"
+    trading_sessions: str
 
     # TwelveData
     twelvedata_api_key: str
+    http_timeout: int
+    http_max_retries: int
+    http_backoff_seconds: float
 
     # Telegram
     telegram_bot_token: str
@@ -82,24 +81,35 @@ class Config:
     atr_sl_mult: float
     atr_tp_mult: float
 
+    # Setup + trigger model
+    setup_ttl_minutes: int
+    entry_zone_atr_mult: float          # zone_half = ATR15 * this
+    entry_zone_min_width: float         # minimum $ width for zone_half
+    trigger_tf: str                     # "1min"
+    trigger_ema_period: int             # EMA on trigger TF
+    trigger_rsi_min_buy: float          # optional
+    trigger_rsi_max_sell: float         # optional
+
+    # Peak-chase guards (M5)
+    ext_atr_mult: float
+    rsi_buy_max: float
+    rsi_sell_min: float
+    bb_band_buffer_atr: float
+    pullback_lookback: int
+
     # News filter
-    news_mode: str  # "BLOCK" or "WARN"
-    news_api_provider: str  # e.g. "fmp"
+    news_mode: str
+    news_api_provider: str
     news_api_key: str
     news_base_url: str
     news_lookahead_min: int
     news_cooldown_after_min: int
 
-    # No-trade alerts
-    send_no_trade_alerts: bool
-    no_trade_alert_cooldown_min: int
-
-    # ✅ NEW: price calibration (fixes discrepancy with MT5 broker feed)
+    # Price calibration (optional)
     broker_price_offset: float
 
-    # ✅ NEW: weekend blocking
+    # Weekend blocking
     block_weekends: bool
-    weekend_timezone: str  # informational (we use UTC in code)
 
     @staticmethod
     def from_env() -> "Config":
@@ -111,6 +121,9 @@ class Config:
             trading_sessions=_env("TRADING_SESSIONS", "00:00-03:00,07:00-11:00,12:00-20:00") or "",
 
             twelvedata_api_key=_env("TWELVEDATA_API_KEY", "") or "",
+            http_timeout=_env_int("HTTP_TIMEOUT", 20),
+            http_max_retries=_env_int("HTTP_MAX_RETRIES", 2),
+            http_backoff_seconds=_env_float("HTTP_BACKOFF_SECONDS", 1.0),
 
             telegram_bot_token=_env("TELEGRAM_BOT_TOKEN", "") or "",
             telegram_chat_id=_env("TELEGRAM_CHAT_ID", "") or "",
@@ -128,6 +141,20 @@ class Config:
             atr_sl_mult=_env_float("ATR_SL_MULT", 1.5),
             atr_tp_mult=_env_float("ATR_TP_MULT", 3.0),
 
+            setup_ttl_minutes=_env_int("SETUP_TTL_MINUTES", 60),
+            entry_zone_atr_mult=_env_float("ENTRY_ZONE_ATR_MULT", 0.25),
+            entry_zone_min_width=_env_float("ENTRY_ZONE_MIN_WIDTH", 2.0),
+            trigger_tf=_env("TRIGGER_TF", "1min") or "1min",
+            trigger_ema_period=_env_int("TRIGGER_EMA_PERIOD", 20),
+            trigger_rsi_min_buy=_env_float("TRIGGER_RSI_MIN_BUY", 45.0),
+            trigger_rsi_max_sell=_env_float("TRIGGER_RSI_MAX_SELL", 55.0),
+
+            ext_atr_mult=_env_float("EXT_ATR_MULT", 0.9),
+            rsi_buy_max=_env_float("RSI_BUY_MAX", 68.0),
+            rsi_sell_min=_env_float("RSI_SELL_MIN", 32.0),
+            bb_band_buffer_atr=_env_float("BB_BAND_BUFFER_ATR", 0.15),
+            pullback_lookback=_env_int("PULLBACK_LOOKBACK", 6),
+
             news_mode=(_env("NEWS_MODE", "WARN") or "WARN").upper(),
             news_api_provider=(_env("NEWS_API_PROVIDER", "fmp") or "fmp").lower(),
             news_api_key=_env("NEWS_API_KEY", "") or "",
@@ -135,11 +162,6 @@ class Config:
             news_lookahead_min=_env_int("NEWS_LOOKAHEAD_MIN", 60),
             news_cooldown_after_min=_env_int("NEWS_COOLDOWN_AFTER_MIN", 30),
 
-            send_no_trade_alerts=_env_bool("SEND_NO_TRADE_ALERTS", True),
-            no_trade_alert_cooldown_min=_env_int("NO_TRADE_ALERT_COOLDOWN_MIN", 20),
-
-            # ✅ NEW ENV VARS
             broker_price_offset=_env_float("BROKER_PRICE_OFFSET", 0.0),
             block_weekends=_env_bool("BLOCK_WEEKENDS", True),
-            weekend_timezone=_env("WEEKEND_TIMEZONE", "UTC") or "UTC",
         )
