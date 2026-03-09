@@ -56,7 +56,7 @@ class Config:
     # Trading windows
     trading_sessions: str
 
-    # TwelveData
+    # TwelveData / HTTP
     twelvedata_api_key: str
     http_timeout: int
     http_max_retries: int
@@ -83,14 +83,14 @@ class Config:
 
     # Setup + trigger model
     setup_ttl_minutes: int
-    entry_zone_atr_mult: float          # zone_half = ATR15 * this
-    entry_zone_min_width: float         # minimum $ width for zone_half
-    trigger_tf: str                     # "1min"
-    trigger_ema_period: int             # EMA on trigger TF
-    trigger_rsi_min_buy: float          # optional
-    trigger_rsi_max_sell: float         # optional
+    entry_zone_atr_mult: float
+    entry_zone_min_width: float
+    trigger_tf: str
+    trigger_ema_period: int
+    trigger_rsi_min_buy: float
+    trigger_rsi_max_sell: float
 
-    # Peak-chase guards (M5)
+    # Peak-chase guards
     ext_atr_mult: float
     rsi_buy_max: float
     rsi_sell_min: float
@@ -105,7 +105,7 @@ class Config:
     news_lookahead_min: int
     news_cooldown_after_min: int
 
-    # Price calibration (optional)
+    # Optional price calibration
     broker_price_offset: float
 
     # Weekend blocking
@@ -132,28 +132,34 @@ class Config:
             ema_slow=_env_int("EMA_SLOW", 50),
             ema_slope_bars=_env_int("EMA_SLOPE_BARS", 10),
             rsi_period=_env_int("RSI_PERIOD", 14),
+
+            # Relaxed defaults
             adx_period=_env_int("ADX_PERIOD", 14),
             adx_min=_env_float("ADX_MIN", 20.0),
-            min_confirmations=_env_int("MIN_CONFIRMATIONS", 5),
+            min_confirmations=_env_int("MIN_CONFIRMATIONS", 4),
             cooldown_minutes=_env_int("COOLDOWN_MINUTES", 30),
 
             atr_period=_env_int("ATR_PERIOD", 14),
             atr_sl_mult=_env_float("ATR_SL_MULT", 1.5),
             atr_tp_mult=_env_float("ATR_TP_MULT", 3.0),
 
-            setup_ttl_minutes=_env_int("SETUP_TTL_MINUTES", 60),
-            entry_zone_atr_mult=_env_float("ENTRY_ZONE_ATR_MULT", 0.25),
-            entry_zone_min_width=_env_float("ENTRY_ZONE_MIN_WIDTH", 2.0),
+            # Wider zone + longer setup life
+            setup_ttl_minutes=_env_int("SETUP_TTL_MINUTES", 180),
+            entry_zone_atr_mult=_env_float("ENTRY_ZONE_ATR_MULT", 0.40),
+            entry_zone_min_width=_env_float("ENTRY_ZONE_MIN_WIDTH", 4.0),
+
+            # Trigger still disciplined
             trigger_tf=_env("TRIGGER_TF", "1min") or "1min",
             trigger_ema_period=_env_int("TRIGGER_EMA_PERIOD", 20),
-            trigger_rsi_min_buy=_env_float("TRIGGER_RSI_MIN_BUY", 45.0),
-            trigger_rsi_max_sell=_env_float("TRIGGER_RSI_MAX_SELL", 55.0),
+            trigger_rsi_min_buy=_env_float("TRIGGER_RSI_MIN_BUY", 40.0),
+            trigger_rsi_max_sell=_env_float("TRIGGER_RSI_MAX_SELL", 60.0),
 
-            ext_atr_mult=_env_float("EXT_ATR_MULT", 0.9),
-            rsi_buy_max=_env_float("RSI_BUY_MAX", 68.0),
-            rsi_sell_min=_env_float("RSI_SELL_MIN", 32.0),
+            # Peak-chase guards relaxed a bit
+            ext_atr_mult=_env_float("EXT_ATR_MULT", 1.2),
+            rsi_buy_max=_env_float("RSI_BUY_MAX", 72.0),
+            rsi_sell_min=_env_float("RSI_SELL_MIN", 28.0),
             bb_band_buffer_atr=_env_float("BB_BAND_BUFFER_ATR", 0.15),
-            pullback_lookback=_env_int("PULLBACK_LOOKBACK", 6),
+            pullback_lookback=_env_int("PULLBACK_LOOKBACK", 8),
 
             news_mode=(_env("NEWS_MODE", "WARN") or "WARN").upper(),
             news_api_provider=(_env("NEWS_API_PROVIDER", "fmp") or "fmp").lower(),
