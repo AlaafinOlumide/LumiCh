@@ -9,18 +9,18 @@ import numpy as np
 @dataclass(frozen=True)
 class TrendState:
     timeframe: str
-    direction: str  # "BULL", "BEAR", "NEUTRAL"
+    direction: str
     close: float
     ema_fast: float
     ema_slow: float
-    slope: str  # "UP", "DOWN", "FLAT"
+    slope: str
 
 
 @dataclass(frozen=True)
 class Signal:
     symbol: str
     timestamp_utc: object
-    direction: str  # "BUY"/"SELL"
+    direction: str
     risk_tag: str
     timeframe_mode: str
     session_label: str
@@ -69,11 +69,7 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     prev_close = close.shift(1)
 
     tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
         axis=1,
     ).max(axis=1)
 
@@ -179,12 +175,12 @@ def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period
     last_rsi = float(rsi.iloc[-1])
 
     if trend_dir == "BULL":
-        if last_close >= last_ema and last_rsi >= 43:
+        if last_close >= last_ema and last_rsi >= 45:
             return True, "M15 confirms bullish continuation (price above EMA, RSI supportive)"
         return False, f"M15 weak for BULL (close {last_close:.2f} vs EMA{ema_fast} {last_ema:.2f}, RSI {last_rsi:.1f})"
 
     if trend_dir == "BEAR":
-        if last_close <= last_ema and last_rsi <= 57:
+        if last_close <= last_ema and last_rsi <= 55:
             return True, "M15 confirms bearish continuation (price below EMA, RSI supportive)"
         return False, f"M15 weak for BEAR (close {last_close:.2f} vs EMA{ema_fast} {last_ema:.2f}, RSI {last_rsi:.1f})"
 
@@ -197,6 +193,69 @@ def risk_tag_from_context(trend_tf: str) -> str:
     return "HIGH"
 
 
+def is_m5_bull_structure(df_m5: pd.DataFrame, lookback: int = 8) -> bool:
+    if len(df_m5) < lookback + 2:
+        return False
+    highs = df_m5["high"].astype(float).tail(lookback)
+    lows = df_m5["low"].astype(float).tail(lookback)
+    recent_high = float(highs.iloc[-1])
+    prior_high = float(highs.iloc[:-2].max())
+    recent_low = float(lows.iloc[-1])
+    prior_low = float(lows.iloc[:-2].min())
+    return recent_high >= prior_high and recent_low > prior_low
+
+
+def is_m5_bear_structure(df_m5: pd.DataFrame, lookback: int = 8) -> bool:
+    if len(df_m5) < lookback + 2:
+        return False
+    highs = df_m5["high"].astype(float).tail(lookback)
+    lows = df_m5["low"].astype(float).tail(lookback)
+    recent_low = float(lows.iloc[-1])
+    prior_low = float(lows.iloc[:-2].min())
+    recent_high = float(highs.iloc[-1])
+    prior_high = float(highs.iloc[:-2].max())
+    return recent_low <= prior_low and recent_high < prior_high
+
+
+def is_market_too_compressed(
+    df_m5: pd.DataFrame,
+    df_m15: pd.DataFrame,
+    ema_fast: int,
+    ema_slow: int,
+    atr_period: int,
+    compression_ema_atr_mult: float,
+    max_overlap_ratio: float,
+) -> tuple[bool, str]:
+    close_m5 = df_m5["close"].astype(float)
+    ef = _ema(close_m5, ema_fast)
+    es = _ema(close_m5, ema_slow)
+    ema_gap = abs(float(ef.iloc[-1]) - float(es.iloc[-1]))
+
+    atr_m15 = atr(df_m15, atr_period)
+    if atr_m15 <= 0:
+        atr_m15 = max(float(df_m15["close"].astype(float).iloc[-1]) * 0.001, 1.0)
+
+    if ema_gap < compression_ema_atr_mult * atr_m15:
+        return True, f"Compression: EMA gap {ema_gap:.2f} too small vs ATR15 {atr_m15:.2f}"
+
+    highs = df_m5["high"].astype(float).tail(10).tolist()
+    lows = df_m5["low"].astype(float).tail(10).tolist()
+    overlaps = 0
+    comparisons = 0
+    for i in range(1, len(highs)):
+        prev_low, prev_high = lows[i - 1], highs[i - 1]
+        cur_low, cur_high = lows[i], highs[i]
+        comparisons += 1
+        if max(prev_low, cur_low) <= min(prev_high, cur_high):
+            overlaps += 1
+
+    overlap_ratio = overlaps / comparisons if comparisons > 0 else 0.0
+    if overlap_ratio >= max_overlap_ratio:
+        return True, f"Compression: candle overlap too high ({overlap_ratio:.2f})"
+
+    return False, "OK"
+
+
 def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str], float, bool, list[str]]:
     close = df_m5["close"].astype(float)
     open_ = df_m5["open"].astype(float)
@@ -204,13 +263,15 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     low = df_m5["low"].astype(float)
 
     ema_fast = _ema(close, cfg.ema_fast)
+    ema_slow = _ema(close, cfg.ema_slow)
     rsi = _rsi(close, cfg.rsi_period)
     adx_series = _adx(df_m5, cfg.adx_period)
-    lower, mid, upper = _bollinger(close, 20, 2.0)
+    lower, _mid, upper = _bollinger(close, 20, 2.0)
 
     last_close = float(close.iloc[-1])
     last_open = float(open_.iloc[-1])
-    last_ema = float(ema_fast.iloc[-1])
+    last_ema_fast = float(ema_fast.iloc[-1])
+    last_ema_slow = float(ema_slow.iloc[-1])
     last_rsi = float(rsi.iloc[-1])
     adx_val = float(adx_series.iloc[-1])
 
@@ -221,40 +282,47 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     if not (atr_m5 == atr_m5) or atr_m5 <= 0:
         atr_m5 = max(last_close * 0.001, 1.0)
 
-    ema_gap = abs(last_close - last_ema)
-    ext_atr_mult = float(getattr(cfg, "ext_atr_mult", 1.2))
-    if ema_gap > ext_atr_mult * atr_m5:
-        reasons.append(f"Blocked: overextended vs EMA (gap {ema_gap:.2f} > {ext_atr_mult:.2f}*ATR {atr_m5:.2f})")
+    ema_gap = abs(last_close - last_ema_fast)
+    if ema_gap > float(cfg.ext_atr_mult) * atr_m5:
+        reasons.append(f"Blocked: overextended vs EMA (gap {ema_gap:.2f} > {cfg.ext_atr_mult:.2f}*ATR {atr_m5:.2f})")
         return [], adx_val, False, reasons
 
-    rsi_buy_max = float(getattr(cfg, "rsi_buy_max", 72.0))
-    rsi_sell_min = float(getattr(cfg, "rsi_sell_min", 28.0))
-    if direction == "BUY" and last_rsi > rsi_buy_max:
-        reasons.append(f"Blocked: RSI too high for BUY ({last_rsi:.1f} > {rsi_buy_max:.1f})")
+    if direction == "BUY" and last_rsi > float(cfg.rsi_buy_max):
+        reasons.append(f"Blocked: RSI too high for BUY ({last_rsi:.1f} > {cfg.rsi_buy_max:.1f})")
         return [], adx_val, False, reasons
-    if direction == "SELL" and last_rsi < rsi_sell_min:
-        reasons.append(f"Blocked: RSI too low for SELL ({last_rsi:.1f} < {rsi_sell_min:.1f})")
+    if direction == "SELL" and last_rsi < float(cfg.rsi_sell_min):
+        reasons.append(f"Blocked: RSI too low for SELL ({last_rsi:.1f} < {cfg.rsi_sell_min:.1f})")
         return [], adx_val, False, reasons
 
     last_upper = float(upper.iloc[-1]) if not np.isnan(upper.iloc[-1]) else last_close
     last_lower = float(lower.iloc[-1]) if not np.isnan(lower.iloc[-1]) else last_close
-    band_buffer = float(getattr(cfg, "bb_band_buffer_atr", 0.15)) * atr_m5
+    band_buffer = float(cfg.bb_band_buffer_atr) * atr_m5
 
     if direction == "BUY" and last_close >= (last_upper - band_buffer):
-        reasons.append("Blocked: BUY near upper Bollinger band (possible exhaustion)")
+        reasons.append("Blocked: BUY near upper Bollinger band")
         return [], adx_val, False, reasons
     if direction == "SELL" and last_close <= (last_lower + band_buffer):
-        reasons.append("Blocked: SELL near lower Bollinger band (possible exhaustion)")
+        reasons.append("Blocked: SELL near lower Bollinger band")
         return [], adx_val, False, reasons
 
-    if direction == "BUY" and last_rsi >= 48:
+    bull_struct = is_m5_bull_structure(df_m5, cfg.structure_lookback)
+    bear_struct = is_m5_bear_structure(df_m5, cfg.structure_lookback)
+
+    if direction == "BUY" and not bull_struct:
+        reasons.append("Blocked: no bullish M5 structure")
+        return [], adx_val, False, reasons
+    if direction == "SELL" and not bear_struct:
+        reasons.append("Blocked: no bearish M5 structure")
+        return [], adx_val, False, reasons
+
+    if direction == "BUY" and last_close >= last_ema_fast and last_close >= last_ema_slow and last_rsi >= 48:
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≥ 48)")
-    elif direction == "SELL" and last_rsi <= 52:
+    elif direction == "SELL" and last_close <= last_ema_fast and last_close <= last_ema_slow and last_rsi <= 52:
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≤ 52)")
 
-    lookback = int(getattr(cfg, "pullback_lookback", 8))
+    lookback = int(cfg.pullback_lookback)
     touched = False
     for i in range(1, min(lookback + 1, len(df_m5))):
         if float(low.iloc[-i]) <= float(ema_fast.iloc[-i]) <= float(high.iloc[-i]):
@@ -262,12 +330,12 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
             break
 
     if direction == "BUY":
-        rejection = (last_close > last_ema) and (last_close > last_open)
+        rejection = (last_close > last_ema_fast) and (last_close > last_open)
         if touched and rejection:
             confirmations.append("Pullback+Rejection")
             reasons.append("M5 pulled back to EMA then rejected upward")
     else:
-        rejection = (last_close < last_ema) and (last_close < last_open)
+        rejection = (last_close < last_ema_fast) and (last_close < last_open)
         if touched and rejection:
             confirmations.append("Pullback+Rejection")
             reasons.append("M5 pulled back to EMA then rejected downward")
@@ -286,7 +354,7 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
         prev_width = max(0.0, prev_upper - prev_lower)
         if bb_width >= prev_width:
             confirmations.append("BB Expansion")
-            reasons.append("Bollinger width expanding (volatility pickup)")
+            reasons.append("Bollinger width expanding")
 
     if len(close) >= 2:
         prev_close = float(close.iloc[-2])
@@ -297,11 +365,14 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
             confirmations.append("Momentum")
             reasons.append("Negative short-term momentum")
 
+    confirmations.append("Structure")
+    reasons.append("M5 structure aligned with trade direction")
+
     adx_pass = adx_val >= float(cfg.adx_min)
     return confirmations, adx_val, adx_pass, reasons
 
 
-def trigger_entry_m1(
+def trigger_entry_m1_confirmed(
     df_m1: pd.DataFrame,
     direction: str,
     ema_period: int,
@@ -312,6 +383,9 @@ def trigger_entry_m1(
     zone_high: float,
     live_price: float,
 ) -> tuple[bool, str]:
+    if len(df_m1) < 3:
+        return False, "Not enough M1 candles"
+
     if not (zone_low <= live_price <= zone_high):
         return False, "Price not inside entry zone"
 
@@ -323,45 +397,53 @@ def trigger_entry_m1(
     ema = _ema(close, ema_period)
     rsi = _rsi(close, rsi_period)
 
-    last_close = float(close.iloc[-1])
-    last_open = float(open_.iloc[-1])
-    last_high = float(high.iloc[-1])
-    last_low = float(low.iloc[-1])
-    last_ema = float(ema.iloc[-1])
-    last_rsi = float(rsi.iloc[-1])
+    c1_open = float(open_.iloc[-2])
+    c1_close = float(close.iloc[-2])
+    c1_high = float(high.iloc[-2])
+    c1_low = float(low.iloc[-2])
 
-    rng = max(last_high - last_low, 0.0001)
-    body = abs(last_close - last_open)
-    body_ratio = body / rng
+    c2_open = float(open_.iloc[-1])
+    c2_close = float(close.iloc[-1])
+    c2_high = float(high.iloc[-1])
+    c2_low = float(low.iloc[-1])
+
+    ema2 = float(ema.iloc[-1])
+    rsi2 = float(rsi.iloc[-1])
+
+    c1_body = abs(c1_close - c1_open)
+    c1_range = max(c1_high - c1_low, 0.0001)
+    c1_body_ratio = c1_body / c1_range
 
     if direction == "BUY":
-        bullish = last_close > last_open
-        above_ema = last_close >= last_ema
-        wick_reject = (last_open - last_low) > body * 0.5 or (last_close - last_low) > body * 0.5
+        c1_bull = c1_close > c1_open
+        c2_confirm = c2_close > c1_high or c2_close > ema2
+        rsi_ok = rsi2 >= rsi_min_buy
+        reject = ((min(c1_open, c1_close) - c1_low) > c1_body * 0.5) or (c1_body_ratio >= 0.35)
 
-        if not bullish:
-            return False, "M1 not bullish"
-        if not above_ema:
-            return False, f"M1 close below EMA{ema_period}"
-        if last_rsi < rsi_min_buy:
-            return False, f"M1 RSI weak ({last_rsi:.1f} < {rsi_min_buy:.1f})"
-        if body_ratio < 0.25 and not wick_reject:
-            return False, "M1 rejection too weak"
-        return True, "Triggered: M1 bullish rejection inside zone"
+        if not c1_bull:
+            return False, "M1 first candle not bullish"
+        if not reject:
+            return False, "M1 first candle rejection weak"
+        if not rsi_ok:
+            return False, f"M1 RSI weak ({rsi2:.1f} < {rsi_min_buy:.1f})"
+        if not c2_confirm:
+            return False, "M1 second candle did not confirm BUY"
+        return True, "Triggered: 2-candle M1 bullish confirmation inside zone"
 
-    bearish = last_close < last_open
-    below_ema = last_close <= last_ema
-    wick_reject = (last_high - last_open) > body * 0.5 or (last_high - last_close) > body * 0.5
+    c1_bear = c1_close < c1_open
+    c2_confirm = c2_close < c1_low or c2_close < ema2
+    rsi_ok = rsi2 <= rsi_max_sell
+    reject = ((c1_high - max(c1_open, c1_close)) > c1_body * 0.5) or (c1_body_ratio >= 0.35)
 
-    if not bearish:
-        return False, "M1 not bearish"
-    if not below_ema:
-        return False, f"M1 close above EMA{ema_period}"
-    if last_rsi > rsi_max_sell:
-        return False, f"M1 RSI weak ({last_rsi:.1f} > {rsi_max_sell:.1f})"
-    if body_ratio < 0.25 and not wick_reject:
-        return False, "M1 rejection too weak"
-    return True, "Triggered: M1 bearish rejection inside zone"
+    if not c1_bear:
+        return False, "M1 first candle not bearish"
+    if not reject:
+        return False, "M1 first candle rejection weak"
+    if not rsi_ok:
+        return False, f"M1 RSI weak ({rsi2:.1f} > {rsi_max_sell:.1f})"
+    if not c2_confirm:
+        return False, "M1 second candle did not confirm SELL"
+    return True, "Triggered: 2-candle M1 bearish confirmation inside zone"
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> float:
