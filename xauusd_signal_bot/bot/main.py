@@ -4,7 +4,6 @@ import datetime as dt
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -17,7 +16,8 @@ from .strategy import (
     m15_confirms,
     risk_tag_from_context,
     score_entry_m5,
-    trigger_entry_m1,
+    trigger_entry_m1_confirmed,
+    is_market_too_compressed,
     Signal,
     atr as atr_value,
     compute_tp_sl_from_atr,
@@ -46,6 +46,7 @@ class SetupState:
     reasons: list[str]
     news_status: str
     trend_state: object
+    zone_mid: float
 
 
 def setup_logging() -> None:
@@ -67,13 +68,7 @@ def _is_weekend_utc(now: dt.datetime) -> bool:
     return now.weekday() >= 5
 
 
-def _safe_entry_from_quote_or_close(
-    td: TwelveDataClient,
-    symbol: str,
-    df_m5,
-    now: dt.datetime,
-    offset: float,
-) -> tuple[float, str]:
+def _safe_entry_from_quote_or_close(td: TwelveDataClient, symbol: str, df_m5, now: dt.datetime, offset: float) -> tuple[float, str]:
     try:
         q = td.fetch_quote_cached(symbol, ttl_seconds=2, now_utc=now)
         return float(q.price) + offset, "QUOTE"
@@ -81,12 +76,18 @@ def _safe_entry_from_quote_or_close(
         return float(df_m5["close"].iloc[-1]) + offset, "M5_CLOSE"
 
 
+def _zone_too_close(new_mid: float, old_mid: float, atr_m15: float, cfg: Config) -> bool:
+    buffer_size = max(atr_m15 * cfg.zone_reentry_buffer_atr, 2.0)
+    return abs(new_mid - old_mid) < buffer_size
+
+
 def fmt_setup(setup: SetupState, confidence: int, emoji: str, effective_setup_min: int) -> str:
     ts = setup.created_utc.strftime("%Y-%m-%d %H:%M")
     lines: list[str] = []
     lines.append(f"Xauusd: {setup.direction} (SETUP)")
-    lines.append(f"ENTRY ZONE: {setup.zone_low:.2f} - {setup.zone_high:.2f}  (ATR15={setup.atr_m15:.2f})")
-    lines.append("Trigger rule: waits for price to enter zone + M1 rejection candle")
+    lines.append(f"ENTRY ZONE: {setup.zone_low:.2f} - {setup.zone_high:.2f}")
+    lines.append(f"(ATR15={setup.atr_m15:.2f})")
+    lines.append("Trigger rule: waits for price to enter zone + 2-candle M1 confirmation")
     lines.append(f"Confidence: {confidence}% {emoji}")
     lines.append("")
     lines.append(f"{ts} UTC | Session: *{setup.session_label}*")
@@ -109,7 +110,7 @@ def fmt_entry(sig: Signal, entry_source: str, trigger_reason: str) -> str:
     ts = sig.timestamp_utc.strftime("%Y-%m-%d %H:%M")
     lines: list[str] = []
     lines.append(f"Xauusd: {sig.direction} (ENTRY TRIGGERED)")
-    lines.append(f"ENTRY: {sig.entry_price:.2f}  ({entry_source})")
+    lines.append(f"ENTRY: {sig.entry_price:.2f} ({entry_source})")
     lines.append(f"TP1: {sig.tp1:.2f}")
     lines.append(f"TP2: {sig.tp2:.2f} (TP2 may not be reached — take profit when convenient)")
     lines.append(f"SL: {sig.sl:.2f}")
@@ -155,6 +156,8 @@ def main() -> None:
     dedupe_state: dict[str, float] = {}
     last_entry_time: dt.datetime | None = None
     last_entry_direction: str | None = None
+    last_zone_mid: float | None = None
+    last_zone_time: dt.datetime | None = None
     setup_state: SetupState | None = None
 
     broker_offset = float(cfg.broker_price_offset)
@@ -173,24 +176,12 @@ def main() -> None:
             now = dt.datetime.now(dt.timezone.utc)
 
             if cfg.block_weekends and _is_weekend_utc(now):
-                _log_dedupe(
-                    log,
-                    key="weekend_block",
-                    message=f"Weekend (UTC). Bot paused. Sleeping {cfg.poll_seconds}s...",
-                    dedupe_state=dedupe_state,
-                    every_seconds=900,
-                )
+                _log_dedupe(log, "weekend_block", f"Weekend (UTC). Bot paused. Sleeping {cfg.poll_seconds}s...", dedupe_state, 900)
                 time.sleep(cfg.poll_seconds)
                 continue
 
             if not now_in_sessions_utc(sessions, now):
-                _log_dedupe(
-                    log,
-                    key="outside_sessions",
-                    message=f"Outside trading sessions. Sleeping {cfg.poll_seconds}s...",
-                    dedupe_state=dedupe_state,
-                    every_seconds=600,
-                )
+                _log_dedupe(log, "outside_sessions", f"Outside trading sessions. Sleeping {cfg.poll_seconds}s...", dedupe_state, 600)
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -207,13 +198,7 @@ def main() -> None:
             )
 
             if news.is_high_impact and cfg.news_mode == "BLOCK":
-                _log_dedupe(
-                    log,
-                    key="blocked_news",
-                    message=f"Signals blocked due to news: {news.message}",
-                    dedupe_state=dedupe_state,
-                    every_seconds=300,
-                )
+                _log_dedupe(log, "blocked_news", f"Signals blocked due to news: {news.message}", dedupe_state, 300)
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -249,6 +234,21 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
+            compressed, compression_reason = is_market_too_compressed(
+                df_m5=df_m5,
+                df_m15=df_m15,
+                ema_fast=cfg.ema_fast,
+                ema_slow=cfg.ema_slow,
+                atr_period=cfg.atr_period,
+                compression_ema_atr_mult=cfg.compression_ema_atr_mult,
+                max_overlap_ratio=cfg.max_overlap_ratio,
+            )
+            if compressed:
+                _log_dedupe(log, "compressed_market", compression_reason, dedupe_state, 180)
+                setup_state = None
+                time.sleep(cfg.poll_seconds)
+                continue
+
             direction = "BUY" if trend.direction == "BULL" else "SELL"
 
             if last_entry_time is not None:
@@ -266,9 +266,7 @@ def main() -> None:
                     _log_dedupe(log, "setup_flip", "Trend direction flipped. Resetting setup.", dedupe_state, 120)
                     setup_state = None
                 else:
-                    entry_ref, entry_src = _safe_entry_from_quote_or_close(
-                        td, cfg.symbol, df_m5, now, broker_offset
-                    )
+                    entry_ref, entry_src = _safe_entry_from_quote_or_close(td, cfg.symbol, df_m5, now, broker_offset)
 
                     trigger_ttl = 60 if cfg.trigger_tf == "1min" else 300
                     df_trigger = td.fetch_time_series_cached(
@@ -279,7 +277,7 @@ def main() -> None:
                         now_utc=now,
                     ).df
 
-                    trig_ok, trig_reason = trigger_entry_m1(
+                    trig_ok, trig_reason = trigger_entry_m1_confirmed(
                         df_m1=df_trigger,
                         direction=setup_state.direction,
                         ema_period=cfg.trigger_ema_period,
@@ -340,16 +338,12 @@ def main() -> None:
                         tg.send_message(fmt_entry(sig, entry_source=entry_src, trigger_reason=trig_reason))
                         last_entry_time = now
                         last_entry_direction = setup_state.direction
+                        last_zone_mid = setup_state.zone_mid
+                        last_zone_time = now
                         setup_state = None
                         log.info("ENTRY triggered: %s %s @ %.2f", sig.direction, cfg.symbol, entry_ref)
                     else:
-                        _log_dedupe(
-                            log,
-                            key="waiting_trigger",
-                            message=f"Waiting trigger: {trig_reason}",
-                            dedupe_state=dedupe_state,
-                            every_seconds=180,
-                        )
+                        _log_dedupe(log, "waiting_trigger", f"Waiting trigger: {trig_reason}", dedupe_state, 180)
 
                     time.sleep(cfg.poll_seconds)
                     continue
@@ -357,46 +351,37 @@ def main() -> None:
             confirmations, adx_val, _adx_pass, reason_bullets = score_entry_m5(df_m5, direction, cfg)
 
             if len(confirmations) < effective_setup_min:
-                _log_dedupe(
-                    log,
-                    "not_enough_setup_confirm",
-                    f"Not enough setup confirmations: {len(confirmations)} (need {effective_setup_min})",
-                    dedupe_state,
-                    180,
-                )
+                _log_dedupe(log, "not_enough_setup_confirm", f"Not enough setup confirmations: {len(confirmations)} (need {effective_setup_min})", dedupe_state, 180)
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            relaxed_adx_min = max(18.0, float(cfg.adx_min) - 2.0)
+            relaxed_adx_min = max(18.0, float(cfg.adx_min) - 1.0)
             if adx_val < relaxed_adx_min:
-                _log_dedupe(
-                    log,
-                    "adx_failed_setup",
-                    f"ADX setup filter failed: {adx_val:.1f} < {relaxed_adx_min:.1f}",
-                    dedupe_state,
-                    180,
-                )
+                _log_dedupe(log, "adx_failed_setup", f"ADX setup filter failed: {adx_val:.1f} < {relaxed_adx_min:.1f}", dedupe_state, 180)
                 time.sleep(cfg.poll_seconds)
                 continue
 
             atr_m15 = atr_value(df_m15, cfg.atr_period)
             entry_ref, entry_src = _safe_entry_from_quote_or_close(td, cfg.symbol, df_m5, now, broker_offset)
 
-            zone_half = max(
-                atr_m15 * float(cfg.entry_zone_atr_mult),
-                float(cfg.entry_zone_min_width),
-            )
+            zone_half = max(atr_m15 * float(cfg.entry_zone_atr_mult), float(cfg.entry_zone_min_width))
             zone_low = entry_ref - zone_half
             zone_high = entry_ref + zone_half
+            zone_mid = (zone_low + zone_high) / 2.0
+
+            if last_zone_mid is not None and last_zone_time is not None:
+                mins_since_zone = (now - last_zone_time).total_seconds() / 60
+                if mins_since_zone < cfg.same_zone_cooldown_minutes and _zone_too_close(zone_mid, last_zone_mid, atr_m15, cfg):
+                    _log_dedupe(log, "same_zone_block", "Skipping repeated setup in same zone.", dedupe_state, 180)
+                    time.sleep(cfg.poll_seconds)
+                    continue
 
             tf_mode = "H1→M15→M5" if trend_tf == "1h" else "M15→M5 (fallback)"
             risk_tag = risk_tag_from_context(trend_tf)
             news_status = ("⚠️ " + news.message) if news.is_high_impact else "Normal"
 
             reasons: list[str] = []
-            reasons.append(
-                f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})"
-            )
+            reasons.append(f"HTF {trend.timeframe} trend {trend.direction} (EMA{cfg.ema_fast} vs EMA{cfg.ema_slow}, slope {trend.slope})")
             reasons.append(confirm_reason)
             reasons.extend(reason_bullets)
 
@@ -417,6 +402,7 @@ def main() -> None:
                 reasons=reasons,
                 news_status=news_status,
                 trend_state=trend,
+                zone_mid=zone_mid,
             )
 
             conf, emoji = confidence_score(
