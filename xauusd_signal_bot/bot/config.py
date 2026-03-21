@@ -88,7 +88,6 @@ class Config:
     bb_band_buffer_atr: float
     pullback_lookback: int
 
-    # new filters
     structure_lookback: int
     compression_ema_atr_mult: float
     max_overlap_ratio: float
@@ -127,33 +126,33 @@ class Config:
             ema_slope_bars=_env_int("EMA_SLOPE_BARS", 10),
             rsi_period=_env_int("RSI_PERIOD", 14),
             adx_period=_env_int("ADX_PERIOD", 14),
-            adx_min=_env_float("ADX_MIN", 19.0),
-            min_confirmations=_env_int("MIN_CONFIRMATIONS", 4),
+            adx_min=_env_float("ADX_MIN", 18.0),
+            min_confirmations=_env_int("MIN_CONFIRMATIONS", 3),
             cooldown_minutes=_env_int("COOLDOWN_MINUTES", 30),
 
             atr_period=_env_int("ATR_PERIOD", 14),
             atr_sl_mult=_env_float("ATR_SL_MULT", 1.5),
             atr_tp_mult=_env_float("ATR_TP_MULT", 3.0),
 
-            setup_ttl_minutes=_env_int("SETUP_TTL_MINUTES", 180),
-            entry_zone_atr_mult=_env_float("ENTRY_ZONE_ATR_MULT", 0.35),
-            entry_zone_min_width=_env_float("ENTRY_ZONE_MIN_WIDTH", 4.0),
+            setup_ttl_minutes=_env_int("SETUP_TTL_MINUTES", 240),
+            entry_zone_atr_mult=_env_float("ENTRY_ZONE_ATR_MULT", 0.45),
+            entry_zone_min_width=_env_float("ENTRY_ZONE_MIN_WIDTH", 6.0),
             trigger_tf=_env("TRIGGER_TF", "1min") or "1min",
             trigger_ema_period=_env_int("TRIGGER_EMA_PERIOD", 20),
-            trigger_rsi_min_buy=_env_float("TRIGGER_RSI_MIN_BUY", 42.0),
-            trigger_rsi_max_sell=_env_float("TRIGGER_RSI_MAX_SELL", 58.0),
+            trigger_rsi_min_buy=_env_float("TRIGGER_RSI_MIN_BUY", 40.0),
+            trigger_rsi_max_sell=_env_float("TRIGGER_RSI_MAX_SELL", 60.0),
 
-            ext_atr_mult=_env_float("EXT_ATR_MULT", 1.15),
-            rsi_buy_max=_env_float("RSI_BUY_MAX", 70.0),
-            rsi_sell_min=_env_float("RSI_SELL_MIN", 30.0),
-            bb_band_buffer_atr=_env_float("BB_BAND_BUFFER_ATR", 0.15),
+            ext_atr_mult=_env_float("EXT_ATR_MULT", 1.35),
+            rsi_buy_max=_env_float("RSI_BUY_MAX", 74.0),
+            rsi_sell_min=_env_float("RSI_SELL_MIN", 26.0),
+            bb_band_buffer_atr=_env_float("BB_BAND_BUFFER_ATR", 0.12),
             pullback_lookback=_env_int("PULLBACK_LOOKBACK", 8),
 
             structure_lookback=_env_int("STRUCTURE_LOOKBACK", 8),
-            compression_ema_atr_mult=_env_float("COMPRESSION_EMA_ATR_MULT", 0.35),
-            max_overlap_ratio=_env_float("MAX_OVERLAP_RATIO", 0.70),
-            same_zone_cooldown_minutes=_env_int("SAME_ZONE_COOLDOWN_MINUTES", 90),
-            zone_reentry_buffer_atr=_env_float("ZONE_REENTRY_BUFFER_ATR", 0.25),
+            compression_ema_atr_mult=_env_float("COMPRESSION_EMA_ATR_MULT", 0.22),
+            max_overlap_ratio=_env_float("MAX_OVERLAP_RATIO", 0.85),
+            same_zone_cooldown_minutes=_env_int("SAME_ZONE_COOLDOWN_MINUTES", 45),
+            zone_reentry_buffer_atr=_env_float("ZONE_REENTRY_BUFFER_ATR", 0.15),
 
             news_mode=(_env("NEWS_MODE", "WARN") or "WARN").upper(),
             news_api_provider=(_env("NEWS_API_PROVIDER", "fmp") or "fmp").lower(),
