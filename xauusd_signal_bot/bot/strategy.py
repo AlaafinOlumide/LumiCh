@@ -141,12 +141,7 @@ def detect_trend(
     else:
         diff = 0.0
 
-    if diff > 0:
-        slope = "UP"
-    elif diff < 0:
-        slope = "DOWN"
-    else:
-        slope = "FLAT"
+    slope = "UP" if diff > 0 else "DOWN" if diff < 0 else "FLAT"
 
     if last_ef > last_es and slope == "UP":
         direction = "BULL"
@@ -175,12 +170,12 @@ def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period
     last_rsi = float(rsi.iloc[-1])
 
     if trend_dir == "BULL":
-        if last_close >= last_ema and last_rsi >= 45:
+        if last_close >= last_ema and last_rsi >= 43:
             return True, "M15 confirms bullish continuation (price above EMA, RSI supportive)"
         return False, f"M15 weak for BULL (close {last_close:.2f} vs EMA{ema_fast} {last_ema:.2f}, RSI {last_rsi:.1f})"
 
     if trend_dir == "BEAR":
-        if last_close <= last_ema and last_rsi <= 55:
+        if last_close <= last_ema and last_rsi <= 57:
             return True, "M15 confirms bearish continuation (price below EMA, RSI supportive)"
         return False, f"M15 weak for BEAR (close {last_close:.2f} vs EMA{ema_fast} {last_ema:.2f}, RSI {last_rsi:.1f})"
 
@@ -188,9 +183,7 @@ def m15_confirms(df_m15: pd.DataFrame, trend_dir: str, ema_fast: int, rsi_period
 
 
 def risk_tag_from_context(trend_tf: str) -> str:
-    if trend_tf in ("1h", "15min"):
-        return "MEDIUM"
-    return "HIGH"
+    return "MEDIUM" if trend_tf in ("1h", "15min") else "HIGH"
 
 
 def is_m5_bull_structure(df_m5: pd.DataFrame, lookback: int = 8) -> bool:
@@ -202,7 +195,7 @@ def is_m5_bull_structure(df_m5: pd.DataFrame, lookback: int = 8) -> bool:
     prior_high = float(highs.iloc[:-2].max())
     recent_low = float(lows.iloc[-1])
     prior_low = float(lows.iloc[:-2].min())
-    return recent_high >= prior_high and recent_low > prior_low
+    return recent_high >= prior_high or recent_low > prior_low
 
 
 def is_m5_bear_structure(df_m5: pd.DataFrame, lookback: int = 8) -> bool:
@@ -214,7 +207,7 @@ def is_m5_bear_structure(df_m5: pd.DataFrame, lookback: int = 8) -> bool:
     prior_low = float(lows.iloc[:-2].min())
     recent_high = float(highs.iloc[-1])
     prior_high = float(highs.iloc[:-2].max())
-    return recent_low <= prior_low and recent_high < prior_high
+    return recent_low <= prior_low or recent_high < prior_high
 
 
 def is_market_too_compressed(
@@ -299,28 +292,37 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
     band_buffer = float(cfg.bb_band_buffer_atr) * atr_m5
 
     if direction == "BUY" and last_close >= (last_upper - band_buffer):
-        reasons.append("Blocked: BUY near upper Bollinger band")
+        reasons.append("Blocked: BUY too near upper Bollinger band")
         return [], adx_val, False, reasons
     if direction == "SELL" and last_close <= (last_lower + band_buffer):
-        reasons.append("Blocked: SELL near lower Bollinger band")
+        reasons.append("Blocked: SELL too near lower Bollinger band")
         return [], adx_val, False, reasons
 
     bull_struct = is_m5_bull_structure(df_m5, cfg.structure_lookback)
     bear_struct = is_m5_bear_structure(df_m5, cfg.structure_lookback)
 
-    if direction == "BUY" and not bull_struct:
-        reasons.append("Blocked: no bullish M5 structure")
-        return [], adx_val, False, reasons
-    if direction == "SELL" and not bear_struct:
-        reasons.append("Blocked: no bearish M5 structure")
-        return [], adx_val, False, reasons
+    if direction == "BUY":
+        if bull_struct:
+            confirmations.append("Structure")
+            reasons.append("M5 structure aligned bullish")
+    else:
+        if bear_struct:
+            confirmations.append("Structure")
+            reasons.append("M5 structure aligned bearish")
 
-    if direction == "BUY" and last_close >= last_ema_fast and last_close >= last_ema_slow and last_rsi >= 48:
+    if direction == "BUY" and last_close >= last_ema_fast and last_rsi >= 48:
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≥ 48)")
-    elif direction == "SELL" and last_close <= last_ema_fast and last_close <= last_ema_slow and last_rsi <= 52:
+    elif direction == "SELL" and last_close <= last_ema_fast and last_rsi <= 52:
         confirmations.append("RSI")
         reasons.append(f"RSI supportive ({last_rsi:.1f} ≤ 52)")
+
+    if direction == "BUY" and last_close >= last_ema_fast and last_close >= last_ema_slow:
+        confirmations.append("EMA Pullback")
+        reasons.append("Price above EMA continuation area")
+    elif direction == "SELL" and last_close <= last_ema_fast and last_close <= last_ema_slow:
+        confirmations.append("EMA Pullback")
+        reasons.append("Price below EMA continuation area")
 
     lookback = int(cfg.pullback_lookback)
     touched = False
@@ -365,9 +367,6 @@ def score_entry_m5(df_m5: pd.DataFrame, direction: str, cfg) -> tuple[list[str],
             confirmations.append("Momentum")
             reasons.append("Negative short-term momentum")
 
-    confirmations.append("Structure")
-    reasons.append("M5 structure aligned with trade direction")
-
     adx_pass = adx_val >= float(cfg.adx_min)
     return confirmations, adx_val, adx_pass, reasons
 
@@ -385,7 +384,6 @@ def trigger_entry_m1_confirmed(
 ) -> tuple[bool, str]:
     if len(df_m1) < 3:
         return False, "Not enough M1 candles"
-
     if not (zone_low <= live_price <= zone_high):
         return False, "Price not inside entry zone"
 
@@ -393,7 +391,6 @@ def trigger_entry_m1_confirmed(
     open_ = df_m1["open"].astype(float)
     high = df_m1["high"].astype(float)
     low = df_m1["low"].astype(float)
-
     ema = _ema(close, ema_period)
     rsi = _rsi(close, rsi_period)
 
@@ -402,48 +399,62 @@ def trigger_entry_m1_confirmed(
     c1_high = float(high.iloc[-2])
     c1_low = float(low.iloc[-2])
 
-    c2_open = float(open_.iloc[-1])
     c2_close = float(close.iloc[-1])
-    c2_high = float(high.iloc[-1])
-    c2_low = float(low.iloc[-1])
-
     ema2 = float(ema.iloc[-1])
     rsi2 = float(rsi.iloc[-1])
 
-    c1_body = abs(c1_close - c1_open)
-    c1_range = max(c1_high - c1_low, 0.0001)
-    c1_body_ratio = c1_body / c1_range
+    if direction == "BUY":
+        if c1_close <= c1_open:
+            return False, "M1 first candle not bullish"
+        if rsi2 < rsi_min_buy:
+            return False, f"M1 RSI weak ({rsi2:.1f} < {rsi_min_buy:.1f})"
+        if c2_close > c1_high or c2_close > ema2:
+            return True, "Triggered: M1 bullish confirmation inside zone"
+        return False, "M1 second candle did not confirm BUY"
+
+    if c1_close >= c1_open:
+        return False, "M1 first candle not bearish"
+    if rsi2 > rsi_max_sell:
+        return False, f"M1 RSI weak ({rsi2:.1f} > {rsi_max_sell:.1f})"
+    if c2_close < c1_low or c2_close < ema2:
+        return True, "Triggered: M1 bearish confirmation inside zone"
+    return False, "M1 second candle did not confirm SELL"
+
+
+def trigger_entry_m5_confirmed(
+    df_m5: pd.DataFrame,
+    direction: str,
+    ema_period: int,
+    rsi_period: int,
+    rsi_min_buy: float,
+    rsi_max_sell: float,
+    zone_low: float,
+    zone_high: float,
+    live_price: float,
+) -> tuple[bool, str]:
+    if len(df_m5) < 2:
+        return False, "Not enough M5 candles"
+    if not (zone_low <= live_price <= zone_high):
+        return False, "Price not inside entry zone"
+
+    close = df_m5["close"].astype(float)
+    open_ = df_m5["open"].astype(float)
+    ema = _ema(close, ema_period)
+    rsi = _rsi(close, rsi_period)
+
+    last_close = float(close.iloc[-1])
+    last_open = float(open_.iloc[-1])
+    last_ema = float(ema.iloc[-1])
+    last_rsi = float(rsi.iloc[-1])
 
     if direction == "BUY":
-        c1_bull = c1_close > c1_open
-        c2_confirm = c2_close > c1_high or c2_close > ema2
-        rsi_ok = rsi2 >= rsi_min_buy
-        reject = ((min(c1_open, c1_close) - c1_low) > c1_body * 0.5) or (c1_body_ratio >= 0.35)
+        if last_close > last_open and last_close >= last_ema and last_rsi >= rsi_min_buy:
+            return True, "Triggered: M5 bullish confirmation inside zone"
+        return False, "M5 bullish trigger not confirmed"
 
-        if not c1_bull:
-            return False, "M1 first candle not bullish"
-        if not reject:
-            return False, "M1 first candle rejection weak"
-        if not rsi_ok:
-            return False, f"M1 RSI weak ({rsi2:.1f} < {rsi_min_buy:.1f})"
-        if not c2_confirm:
-            return False, "M1 second candle did not confirm BUY"
-        return True, "Triggered: 2-candle M1 bullish confirmation inside zone"
-
-    c1_bear = c1_close < c1_open
-    c2_confirm = c2_close < c1_low or c2_close < ema2
-    rsi_ok = rsi2 <= rsi_max_sell
-    reject = ((c1_high - max(c1_open, c1_close)) > c1_body * 0.5) or (c1_body_ratio >= 0.35)
-
-    if not c1_bear:
-        return False, "M1 first candle not bearish"
-    if not reject:
-        return False, "M1 first candle rejection weak"
-    if not rsi_ok:
-        return False, f"M1 RSI weak ({rsi2:.1f} > {rsi_max_sell:.1f})"
-    if not c2_confirm:
-        return False, "M1 second candle did not confirm SELL"
-    return True, "Triggered: 2-candle M1 bearish confirmation inside zone"
+    if last_close < last_open and last_close <= last_ema and last_rsi <= rsi_max_sell:
+        return True, "Triggered: M5 bearish confirmation inside zone"
+    return False, "M5 bearish trigger not confirmed"
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -491,7 +502,7 @@ def confidence_score(
     adx_bonus = 0.0
     if adx_value >= adx_min:
         adx_bonus = 10.0
-    if adx_value >= adx_min + 8:
+    if adx_value >= adx_min + 6:
         adx_bonus = 15.0
 
     news_adj = 10.0 if news_is_normal else -10.0
