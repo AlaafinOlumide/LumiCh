@@ -17,12 +17,15 @@ from .strategy import (
     risk_tag_from_context,
     score_entry_m5,
     trigger_entry_m1_confirmed,
+    trigger_entry_m5_confirmed,
     is_market_too_compressed,
     Signal,
     atr as atr_value,
     compute_tp_sl_from_atr,
     confidence_score,
 )
+
+
 from .telegram import TelegramClient
 
 
@@ -87,7 +90,7 @@ def fmt_setup(setup: SetupState, confidence: int, emoji: str, effective_setup_mi
     lines.append(f"Xauusd: {setup.direction} (SETUP)")
     lines.append(f"ENTRY ZONE: {setup.zone_low:.2f} - {setup.zone_high:.2f}")
     lines.append(f"(ATR15={setup.atr_m15:.2f})")
-    lines.append("Trigger rule: waits for price to enter zone + 2-candle M1 confirmation")
+    lines.append("Trigger rule: waits for price to enter zone + M1 or M5 confirmation")
     lines.append(f"Confidence: {confidence}% {emoji}")
     lines.append("")
     lines.append(f"{ts} UTC | Session: *{setup.session_label}*")
@@ -161,14 +164,15 @@ def main() -> None:
     setup_state: SetupState | None = None
 
     broker_offset = float(cfg.broker_price_offset)
-    effective_setup_min = max(3, int(cfg.min_confirmations) - 1)
+    effective_setup_min = max(2, int(cfg.min_confirmations))
+    effective_entry_min = max(3, int(cfg.min_confirmations))
 
     log.info(
         "Bot started. Sessions=%s | Symbol=%s | setup_min=%s | entry_min=%s",
         cfg.trading_sessions,
         cfg.symbol,
         effective_setup_min,
-        cfg.min_confirmations,
+        effective_entry_min,
     )
 
     while True:
@@ -245,7 +249,6 @@ def main() -> None:
             )
             if compressed:
                 _log_dedupe(log, "compressed_market", compression_reason, dedupe_state, 180)
-                setup_state = None
                 time.sleep(cfg.poll_seconds)
                 continue
 
@@ -268,17 +271,10 @@ def main() -> None:
                 else:
                     entry_ref, entry_src = _safe_entry_from_quote_or_close(td, cfg.symbol, df_m5, now, broker_offset)
 
-                    trigger_ttl = 60 if cfg.trigger_tf == "1min" else 300
-                    df_trigger = td.fetch_time_series_cached(
-                        cfg.symbol,
-                        cfg.trigger_tf,
-                        outputsize=200,
-                        ttl_seconds=trigger_ttl,
-                        now_utc=now,
-                    ).df
+                    df_m1 = td.fetch_time_series_cached(cfg.symbol, "1min", outputsize=200, ttl_seconds=60, now_utc=now).df
 
-                    trig_ok, trig_reason = trigger_entry_m1_confirmed(
-                        df_m1=df_trigger,
+                    trig_ok_m1, trig_reason_m1 = trigger_entry_m1_confirmed(
+                        df_m1=df_m1,
                         direction=setup_state.direction,
                         ema_period=cfg.trigger_ema_period,
                         rsi_period=cfg.rsi_period,
@@ -288,6 +284,21 @@ def main() -> None:
                         zone_high=setup_state.zone_high,
                         live_price=entry_ref,
                     )
+
+                    trig_ok_m5, trig_reason_m5 = trigger_entry_m5_confirmed(
+                        df_m5=df_m5,
+                        direction=setup_state.direction,
+                        ema_period=cfg.trigger_ema_period,
+                        rsi_period=cfg.rsi_period,
+                        rsi_min_buy=cfg.trigger_rsi_min_buy,
+                        rsi_max_sell=cfg.trigger_rsi_max_sell,
+                        zone_low=setup_state.zone_low,
+                        zone_high=setup_state.zone_high,
+                        live_price=entry_ref,
+                    )
+
+                    trig_ok = trig_ok_m1 or trig_ok_m5
+                    trig_reason = trig_reason_m1 if trig_ok_m1 else trig_reason_m5
 
                     if trig_ok:
                         atr_m15 = setup_state.atr_m15
@@ -305,7 +316,7 @@ def main() -> None:
 
                         conf, emoji = confidence_score(
                             confirmations_passed=len(setup_state.confirmations),
-                            confirmations_required=effective_setup_min,
+                            confirmations_required=effective_entry_min,
                             adx_value=setup_state.adx_val,
                             adx_min=float(cfg.adx_min),
                             news_is_normal=not news.is_high_impact,
@@ -321,7 +332,7 @@ def main() -> None:
                             trend_state=setup_state.trend_state,
                             confirmations=setup_state.confirmations,
                             confirmations_passed=len(setup_state.confirmations),
-                            confirmations_required=effective_setup_min,
+                            confirmations_required=effective_entry_min,
                             adx_value=setup_state.adx_val,
                             adx_min=float(cfg.adx_min),
                             news_status=setup_state.news_status,
@@ -343,7 +354,7 @@ def main() -> None:
                         setup_state = None
                         log.info("ENTRY triggered: %s %s @ %.2f", sig.direction, cfg.symbol, entry_ref)
                     else:
-                        _log_dedupe(log, "waiting_trigger", f"Waiting trigger: {trig_reason}", dedupe_state, 180)
+                        _log_dedupe(log, "waiting_trigger", f"Waiting trigger: {trig_reason_m1} | {trig_reason_m5}", dedupe_state, 180)
 
                     time.sleep(cfg.poll_seconds)
                     continue
@@ -355,7 +366,7 @@ def main() -> None:
                 time.sleep(cfg.poll_seconds)
                 continue
 
-            relaxed_adx_min = max(18.0, float(cfg.adx_min) - 1.0)
+            relaxed_adx_min = max(17.0, float(cfg.adx_min) - 1.0)
             if adx_val < relaxed_adx_min:
                 _log_dedupe(log, "adx_failed_setup", f"ADX setup filter failed: {adx_val:.1f} < {relaxed_adx_min:.1f}", dedupe_state, 180)
                 time.sleep(cfg.poll_seconds)
