@@ -286,8 +286,7 @@ def is_market_too_compressed(
     ef = ema(close_m5, ema_fast)
     es = ema(close_m5, ema_slow)
     ema_gap = abs(float(ef.iloc[-1]) - float(es.iloc[-1]))
-    atr_m15 = atr(df_m15, atr_period)
-
+    atr_m15 = min(atr(df_m15, atr_period), float(getattr(cfg, 'compression_atr_cap', 8.0)))
     if ema_gap < compression_ema_atr_mult * atr_m15:
         return True, (
             f"Compression: EMA gap {ema_gap:.2f} < "
