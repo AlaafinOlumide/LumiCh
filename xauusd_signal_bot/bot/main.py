@@ -398,6 +398,8 @@ def main() -> None:
                         cfg.symbol, "1min", outputsize=200, ttl_seconds=60, now_utc=now
                     ).df
 
+                    _atr_m15_live = setup_state.atr_m15
+
                     trig_ok_m1, trig_reason_m1 = trigger_entry_m1_confirmed(
                         df_m1=df_m1,
                         direction=setup_state.direction,
@@ -408,6 +410,7 @@ def main() -> None:
                         zone_low=setup_state.zone_low,
                         zone_high=setup_state.zone_high,
                         live_price=entry_ref,
+                        atr_val=_atr_m15_live,
                     )
                     trig_ok_m5, trig_reason_m5 = trigger_entry_m5_confirmed(
                         df_m5=df_m5,
@@ -419,6 +422,7 @@ def main() -> None:
                         zone_low=setup_state.zone_low,
                         zone_high=setup_state.zone_high,
                         live_price=entry_ref,
+                        atr_val=_atr_m15_live,
                     )
                     # M15 trigger: only in strong (non-pullback) H1 trends
                     is_strong_h1 = trend_tf == "1h" and "PULLBACK" not in trend.direction
@@ -434,6 +438,7 @@ def main() -> None:
                             zone_low=setup_state.zone_low,
                             zone_high=setup_state.zone_high,
                             live_price=entry_ref,
+                            atr_val=_atr_m15_live,
                         )
 
                     if trig_ok_m1:
